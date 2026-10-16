@@ -189,21 +189,10 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
-    /// bbport: pages the guest writes while they hold recent GPU data (InvalidateMemory): the
-    /// guest bytes of their GPU-written ranges as the write began. An upload sends only the bytes
-    /// the guest changed since (the rest keeps the GPU's data); a read-back keeps those bytes.
-    struct ShadowRange {
-        VAddr start;
-        std::vector<u8> bytes;
-    };
-    std::mutex shadow_mutex;
-    std::unordered_map<VAddr, std::vector<ShadowRange>> shadows;
-    std::atomic<u32> shadow_pages{0};
-    void ShadowGpuData(VAddr page, u64 length);
-
-    /// bbport: GPU data a guest write lands on, written by GPU work that has completed: read
-    /// back on a second queue of the graphics family, which waits for nothing queued since
-    /// (Finish waits for the whole queue). False when unavailable.
+    /// bbport: GPU data a guest write lands on, read back on a second queue of the graphics
+    /// family before the page becomes accessible. That queue waits on the GPU for the work that
+    /// wrote the faulting pages only (Finish waits for the whole queue and the read-back after
+    /// it); neighbouring pages come along when their data is complete. False when unavailable.
     struct SideQueue;
     std::unique_ptr<SideQueue> side_queue;
     bool DownloadOnSideQueue(VAddr page, u64 length);
