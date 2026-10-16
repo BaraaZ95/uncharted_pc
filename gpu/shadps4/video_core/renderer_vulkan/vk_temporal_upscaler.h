@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "common/types.h"
+#include "video_core/renderer_vulkan/hires_output.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_fsr4.h"
@@ -83,7 +84,41 @@ public:
     /// draw's render state (Rasterizer::BeginRendering).
     [[nodiscard]] u64 RedirectState() const noexcept {
         return u64(ui_phase) | u64(display_redirect) << 1 | u64(done_this_frame) << 2 |
+               u64(hires_post_phase) << 3 | u64(hires_display) << 4 |
                u64(ui_color.index) << 8 | u64(ui_depth.index) << 36;
+    }
+
+    // Hi-res output (BB_HIRES_OUTPUT, Uncharted): the scene stays 1920x1080, DLSS / FSR 3.1
+    // reconstruct it at the output size, the game's post-processing passes and its HUD are drawn
+    // into output-size images (docs/upscaler.md).
+    /// BB_HIRES_OUTPUT is set and this session can use it (velocity mode, no BB_RENDER_RES).
+    [[nodiscard]] bool HiResSession() const noexcept {
+        return hires_session;
+    }
+    /// From the upscale to the first display draw of the frame: the game's graphics passes
+    /// over 1920x1080 targets are drawn into output-size proxies (RasterScaling).
+    [[nodiscard]] bool HiResPostPhase() const noexcept {
+        return hires_post_phase;
+    }
+    /// The display draws of this frame (HUD-less pass and HUD) go to the output-size image.
+    [[nodiscard]] bool HiResDisplay() const noexcept {
+        return hires_display;
+    }
+    /// The draw being prepared is the first into the display buffer of a frame whose inputs
+    /// are checked (OnHudlessInputs) or probed (BB_HIRES_PROBE).
+    [[nodiscard]] bool WantsHudlessProbe() const noexcept {
+        return hires_display_pending || probe_hudless;
+    }
+    /// What that draw's textures were: `proxies` read enlarged proxies, `native_fullres` native
+    /// 1920x1080 color images. Decides whether the display pass is redirected.
+    void OnHudlessInputs(u32 proxies, u32 native_fullres);
+    /// BB_HIRES_PROBE: between the upscale and the display draw of a probed frame, the passes
+    /// are printed (Rasterizer::ProbeDraw / ProbeDispatch); the epoch counts such frames.
+    [[nodiscard]] bool InProbeWindow() const noexcept {
+        return probe_window;
+    }
+    [[nodiscard]] u32 ProbeEpoch() const noexcept {
+        return probe_epoch;
     }
 
 
@@ -149,6 +184,16 @@ private:
     u64 view_uses = 0;
 
     void Run();
+    /// Hi-res output: the upscale from 1920x1080 to the output size, the 1080p write-back for
+    /// native readers and the enlarged proxy of the scene color for the post passes.
+    void RunHiRes();
+    /// Decides whether hi-res output runs this frame (OnFrameStart); true when that changed.
+    bool UpdateHiRes(bool active, int upscaler);
+    /// The upscale at the output size failed: this provider runs at 1080p from now on.
+    void HiResFailed(const char* what);
+    void CreateHiResPipeline();
+    /// BB_HIRES_PROBE: whether the frame whose upscale trigger just ran is printed.
+    bool ProbeFrameWanted();
     /// The scene depth and the game's motion vectors for frame generation (velocity mode).
     void CaptureFrameGen();
     void RunScaled();
@@ -204,6 +249,35 @@ private:
     int applied_upscaler = -1;
     bool dispatched_last_frame = false;
     bool last_active = false, last_jitter = false;
+
+    // Hi-res output state (see RunHiRes, UpdateHiRes). Guest targets stay 1920x1080: the
+    // target_width / target_height of the scaled presets are not used.
+    bool hires_session = false;     ///< requested and possible in this session
+    u32 hires_width = 0, hires_height = 0;
+    bool hires_on = false;          ///< running (UpdateHiRes: every condition holds)
+    bool hires_post_phase = false;  ///< from the upscale to the first display draw
+    bool hires_frame = false;       ///< this frame's upscale ran at the output size
+    bool hires_display = false;     ///< the display draws of this frame go to the host image
+    bool hires_display_pending = false; ///< the HUD-less pass has not decided it yet
+    bool hires_display_started = false; ///< the host display image was begun this frame
+    bool hires_recording = false;   ///< RunHiRes is recording the provider
+    bool hires_memory_checked = false, hires_memory_ok = true;
+    u32 hires_prune_frames = 0;     ///< frames since the last SceneTargets::PruneStale
+    int hires_provider_failed = -1; ///< the provider (BbSettings::Upscaler) that failed at the output size
+    HiResOutput::Reason hires_reason = HiResOutput::Reason::NotRequested;
+    HiResOutput::ChainMonitor chain;
+    bool display_check = true;      ///< BB_HIRES_DISPLAY_CHECK
+    bool hires_force = false;       ///< BB_HIRES_FORCE
+    bool probe = false;             ///< BB_HIRES_PROBE
+    bool probe_window = false;      ///< between the upscale and the display draw of a probed frame
+    bool probe_hudless = false;     ///< the display draw of a probed frame is next
+    bool probe_seen = false;        ///< the trigger ran this frame
+    u32 probe_epoch = 0, probe_triggers = 0;
+    const char* probe_trigger_file = nullptr; ///< BB_HIRES_PROBE_TRIGGER
+    vk::UniqueDescriptorSetLayout hires_desc_layout;
+    vk::UniquePipelineLayout hires_pipeline_layout;
+    vk::UniquePipeline hires_pipeline;
+    vk::UniqueSampler hires_sampler;
 
 
     bool enabled = false;

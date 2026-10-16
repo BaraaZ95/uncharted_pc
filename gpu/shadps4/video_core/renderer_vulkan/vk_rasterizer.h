@@ -499,6 +499,19 @@ private:
     u64 proxy_samples = 0; ///< texture bindings that read a scene proxy (statistics)
     float sampler_lod_bias = 0.0f; ///< bbport: extra bias of this draw's samplers
     bool scene_debug_frame = false; ///< BB_SCENE_DEBUG: this frame's passes are printed
+    // bbport hi-res output (BB_HIRES_OUTPUT, vk_temporal_upscaler.h).
+    bool display_run = false; ///< the previous draw went into the display buffer (no new frame start)
+    /// The inputs of the draw being bound, when it is the HUD-less pass of a frame to check
+    /// (TemporalUpscaler::OnHudlessInputs): enlarged proxies and native 1080p color images read.
+    struct HudlessProbe {
+        bool active = false;
+        u32 proxies = 0, native = 0;
+    } hudless_probe{};
+    u32 probe_epoch = 0;  ///< BB_HIRES_PROBE: the probe frame ProbeDraw last printed for
+    u64 probe_last = 0;   ///< ... and the pass it printed last
+    /// BB_HIRES_PROBE: one line per pass between the upscale and the display draw.
+    void ProbeDraw(const GraphicsPipeline* pipeline);
+    void ProbeDispatch(const Shader::Info& cs, const AmdGpu::ComputeProgram& program);
     bool PendingWriteOverlaps(VAddr address, u64 size);
     /// Stage B: the ring bindings of the stages of the packet being recorded.
     struct RingStage {

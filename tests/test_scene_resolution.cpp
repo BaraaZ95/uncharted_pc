@@ -196,6 +196,74 @@ int main() {
         assert(result == 0xff00ff00);
     }
     std::puts("Scene targets: half-resolution mip level proxy roundtrip PASS");
+
+    // Hi-res output (BB_HIRES_OUTPUT): proxies larger than the native image.
+    targets.SetSize({3840, 2160});
+    // A compute write adopted into the proxy: no fill, current only once marked, and dropped by
+    // the next native write.
+    clear_native(0xff000000);
+    const auto adopted = targets.AdoptWrite(color_id, cv);
+    assert(adopted && adopted->layout == vk::ImageLayout::eGeneral);
+    assert(!targets.ProxyCurrent(images[color_id]));
+    targets.MarkAdopted(color_id);
+    assert(targets.ProxyCurrent(images[color_id]));
+    clear_native(0xff00ff00);
+    assert(!targets.ProxyCurrent(images[color_id]));
+    // Linear resolve: a native pixel averages its 2x2 block of the proxy (left column red,
+    // right column black: half red). The default is nearest.
+    targets.linear_resample = true;
+    clear_native(0xff000000);
+    const auto enlarged = targets.Attachment(color_id, cv);
+    {
+        auto cmd = scheduler.CommandBuffer();
+        const vk::RenderingAttachmentInfo color{.imageView=enlarged.view,.imageLayout=enlarged.layout,
+            .loadOp=vk::AttachmentLoadOp::eClear,.storeOp=vk::AttachmentStoreOp::eStore,
+            .clearValue=vk::ClearValue{.color={.float32=std::array{0.f,0.f,0.f,1.f}}}};
+        cmd.beginRendering({.renderArea={{0,0},{3840,2160}},.layerCount=1,
+            .colorAttachmentCount=1,.pColorAttachments=&color}, dispatch);
+        const vk::ClearAttachment red{.aspectMask=vk::ImageAspectFlagBits::eColor,
+            .colorAttachment=0,
+            .clearValue=vk::ClearValue{.color={.float32=std::array{1.f,0.f,0.f,1.f}}}};
+        const vk::ClearRect block{.rect={{3838,2158},{1,2}},.baseArrayLayer=0,.layerCount=1};
+        cmd.clearAttachments(red, block, dispatch);
+        cmd.endRendering(dispatch);
+    }
+    runtime.Transit(&images[color_id],vk::ImageLayout::eTransferSrcOptimal,
+        vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferRead);
+    runtime.FlushBarriers();
+    const u32 averaged = pixel(images[color_id].GetImage(),vk::ImageAspectFlagBits::eColor,
+                               vk::ImageLayout::eTransferSrcOptimal,1920,1080) & 255;
+    if (instance.GetPhysicalDevice().getFormatProperties(ci.pixel_format).optimalTilingFeatures &
+        vk::FormatFeatureFlagBits::eSampledImageFilterLinear) {
+        assert(averaged >= 126 && averaged <= 129);
+    }
+    targets.linear_resample = false;
+    // The cap on images with proxies, and the 960x540 switch.
+    targets.SetSize({2560, 1440});
+    const auto other_id = images.insert(instance, runtime, views, ci);
+    targets.max_proxies = 1;
+    assert(targets.Eligible(images[color_id]) && targets.Eligible(images[other_id]));
+    (void)targets.Attachment(color_id, cv);
+    assert(targets.Eligible(images[color_id]) && !targets.Eligible(images[other_id]));
+    assert(!targets.AdoptWrite(other_id, cv));
+    // A level load recreates targets: the proxy of a destroyed image is freed, which makes
+    // room under the cap again.
+    assert(targets.PruneStale() == 0);
+    const auto gone_id = images.insert(instance, runtime, views, ci);
+    targets.max_proxies = 0;
+    (void)targets.Attachment(gone_id, cv);
+    scheduler.Finish();
+    images.erase(gone_id);
+    assert(targets.PruneStale() == 1 && targets.PruneStale() == 0);
+    targets.max_proxies = 2;
+    assert(targets.Eligible(images[other_id]));
+    targets.max_proxies = 0;
+    assert(targets.Eligible(images[other_id]));
+    assert(targets.Eligible(images[half_id]));
+    targets.half_res = false;
+    assert(!targets.Eligible(images[half_id]) && targets.Eligible(images[color_id]));
+    targets.half_res = true;
+    std::puts("Scene targets: hi-res output proxies (adopt, linear resolve, cap) PASS");
     scheduler.Finish();
     vmaDestroyBuffer(instance.GetAllocator(),readback,allocation);
 }

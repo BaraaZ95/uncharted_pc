@@ -6,6 +6,7 @@
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include "video_core/renderer_vulkan/scene_resolution.h"
 #include "video_core/texture_cache/image.h"
 
@@ -63,8 +64,25 @@ public:
     [[nodiscard]] bool Tracks(u64 image_uid) const {
         return !copying && tracked.contains(image_uid);
     }
+    /// The proxy of `image` for a compute write outside a render pass (General layout, storage
+    /// view): no fill from the native image, its content is about to be overwritten. Null when
+    /// the image is not Eligible or has no storage usage. Follow with MarkAdopted.
+    std::optional<Target> AdoptWrite(VideoCore::ImageId, const VideoCore::ImageViewInfo&);
+    /// The proxy written by AdoptWrite holds the current content; the native image agrees.
+    void MarkAdopted(VideoCore::ImageId);
+    /// Frees the proxies of images the texture cache no longer has (render targets recreated
+    /// by a level load): a session of one size otherwise keeps them, and the max_proxies cap
+    /// would stay reached. Waits for the GPU only when there is one to free; the count.
+    u32 PruneStale();
     void ResolveAll();
     bool debug = false; ///< BB_SCENE_DEBUG frame: print resolves and fills
+    // bbport hi-res output (BB_HIRES_OUTPUT, vk_temporal_upscaler.h); the defaults are the
+    // behaviour of the live presets.
+    bool half_res = true;         ///< 960x540 targets get proxies too (else only 1920x1080 ones)
+    bool linear_resample = false; ///< color fills and resolves filter linearly (else nearest)
+    u32 max_proxies = 0;          ///< most images with proxies, 0: unlimited
+    bool report_native_writes = false; ///< print native writes to an image with a current proxy
+    u64 current_shader = 0;       ///< the draw or dispatch being bound (for those reports)
 private:
     struct Entry {
         VideoCore::ImageId source{};
@@ -78,8 +96,9 @@ private:
     static constexpr u64 Key(u64 uid, u32 level) {
         return uid << 4 | level;
     }
-    Entry& Get(VideoCore::ImageId, u32 level = 0);
+    Entry& Get(VideoCore::ImageId, u32 level = 0, bool fill = true);
     vk::ImageView View(Entry&, const VideoCore::Image&, const VideoCore::ImageViewInfo&);
+    void ReportNativeWrite(const VideoCore::Image&);
     void Copy(Entry&, VideoCore::Image&, bool to_native);
     // Depth/stencil formats without blit support (D32S8 on RADV) are resampled by a
     // fullscreen draw writing gl_FragDepth and, with stencil export, the stencil value.
@@ -99,6 +118,8 @@ private:
     SceneResolution::Size size;
     std::unordered_map<u64, std::unique_ptr<Entry>> entries; ///< by Key(uid, level)
     std::unordered_set<u64> tracked; ///< uids with proxies
+    mutable bool proxy_cap_reported = false;
+    std::vector<std::pair<u64, u64>> native_write_reports; ///< (shader, image uid) printed
     bool copying = false;
     bool force_stencil_bits = false; ///< test the portable resampler on any driver
     u64 generation = 0;

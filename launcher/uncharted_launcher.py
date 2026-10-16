@@ -78,6 +78,11 @@ ANTI_ALIASING = [('off', "Off (the game's own)"), ('taa', 'TAA'), ('fsr3', 'AMD 
                  ('fsr4', 'AMD FSR 4 (Native AA)'), ('dlss', 'NVIDIA DLSS (DLAA, GeForce RTX)')]
 FSR411 = ('fsr411', 'AMD FSR 4.1.1 (Native AA)')
 AA_SHARPNESS = [('0', 'Off'), ('0.2', 'Low'), ('0.4', 'Medium'), ('0.7', 'High')]
+# Hi-res output (BB_HIRES_OUTPUT, experimental): DLSS or FSR 3.1 reconstruct the 1920x1080 scene at
+# this size and the games' effects and HUD are drawn at it. Only with these anti-aliasing modes.
+OUTPUT_RESOLUTIONS = [('native', "1920 × 1080 (the games' own, scaled to the window)"),
+                      ('2560x1440', '2560 × 1440 with DLSS / FSR (experimental)')]
+HIRES_ANTI_ALIASING = ('dlss', 'fsr3')
 # Frames generated between two of the game's (BB_FRAME_GEN, BB_FRAME_GEN_MULTIPLIER).
 FRAME_GENERATION = [('off', 'Off'), ('fsr3', 'AMD FSR 3 Frame Generation (any GPU)'),
                     ('dlss', 'NVIDIA DLSS Frame Generation (GeForce RTX 40/50)')]
@@ -135,7 +140,8 @@ RESERVED_KEYS = {'Insert': 'Insert opens the in-game settings menu.',
 APP_DEFAULTS = {'game_dir': '', 'user_dir': '', 'start': 'u1', 'language': '1', 'player_name': '',
                 'fullscreen': False, 'present_mode': 'Mailbox', 'frame_rate': '60', 'show_fps': False,
                 'window_size': '1920x1080', 'scaler': 'fsr1', 'sharpening': '500',
-                'anti_aliasing': 'off', 'aa_sharpness': '0.2', 'frame_generation': 'off',
+                'anti_aliasing': 'off', 'aa_sharpness': '0.2', 'output_resolution': 'native',
+                'frame_generation': 'off',
                 'frame_gen_multiplier': '2', 'extra_env': '', 'close_on_play': False,
                 'mouse_look': True, 'mouse_sensitivity': '1.0', 'mouse_invert_y': False,
                 'pad_invert_y': False, 'key_bindings': {}, 'pad_bindings': {}, 'check_updates': True}
@@ -313,6 +319,9 @@ def game_environment(s, start=None):
     env['BB_FSR_SHARPNESS'] = str(s.get('aa_sharpness') or '0')
     env['BB_FRAME_GEN'] = str(s.get('frame_generation') or 'off')
     env['BB_FRAME_GEN_MULTIPLIER'] = str(s.get('frame_gen_multiplier') or '2')
+    output = str(s.get('output_resolution') or 'native')
+    if output != 'native' and env['BB_UPSCALER'] in HIRES_ANTI_ALIASING:
+        env['BB_HIRES_OUTPUT'] = output
     for item in str(s['extra_env']).split():
         if '=' in item:
             key, value = item.split('=', 1)
@@ -982,6 +991,11 @@ class Launcher:
                    'smoother edges and less shimmering than the games\' own. DLSS needs a GeForce RTX; '
                    'FSR 4 runs best on a Radeon RX 7000/9000 or a GeForce RTX 40/50.'))
         self.row(f, _('Anti-aliasing sharpness'), self.choice(f, 'aa_sharpness', AA_SHARPNESS, 34))
+        self.row(f, _('Output resolution'), self.choice(f, 'output_resolution', OUTPUT_RESOLUTIONS, 34),
+                 _('With DLSS or FSR 3 anti-aliasing above, they reconstruct the 1920 × 1080 scene at this '
+                   'size and the games\' effects and HUD are drawn at it. Falls back to 1080p scaling when '
+                   'something is not supported (the log says why). Use a window or screen at least this large. '
+                   'Frame generation below must be off for now.'))
         self.section(f, _('Frame generation'))
         hint = _('Frames made between two of the game\'s, for smoother motion: 60 FPS shows as 120. '
                  'Use Mailbox or Immediate presentation and a display of at least that refresh rate. '

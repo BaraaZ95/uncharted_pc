@@ -92,6 +92,12 @@ struct Values {
     std::atomic<int> frame_gen_multiplier{2};
     std::atomic<int> dlssg_max_multiplier{1};
     std::atomic<const char*> frame_gen_problem{nullptr};
+    /// Hi-res output (BB_HIRES_OUTPUT, Uncharted; vk_temporal_upscaler.h): the requested size, zero
+    /// when not requested; whether it runs now and, when not, why. Read once at start and never
+    /// saved to bbport.ini (a stale file value must not turn it on).
+    int hires_width = 0, hires_height = 0;
+    std::atomic<bool> hires_active{false};
+    std::atomic<const char*> hires_status{nullptr};
 
     /// Startup settings for the explicit BB_RENDER_RES compatibility patch only.
     int startup_preset = NativeAA;

@@ -1291,9 +1291,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     const auto& regs = Regs();
     // bbport: the pass copying a finished frame to a display buffer; the previous draw's
-    // target is that frame.
-    if (camera_motion->Enabled() && regs.color_buffers[0] &&
-        FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
+    // target is that frame. Hi-res output: the draws that follow it into the display buffer (the
+    // HUD) belong to the same frame: it starts once.
+    const bool display_draw = camera_motion->Enabled() && regs.color_buffers[0] &&
+                              FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address());
+    if (display_draw && !(upscaler->HiResSession() && display_run)) {
         scene_started = false;
         camera_motion->OnDisplayPass(cb_descs[0].first);
         if (upscaler->OnFrameStart()) {
@@ -1306,6 +1308,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         static const char* scene_debug = std::getenv("BB_SCENE_DEBUG");
         scene_debug_frame = scene_debug && std::remove(scene_debug) == 0;
         scene_targets->debug = scene_debug_frame;
+    }
+    if (upscaler->HiResSession()) {
+        display_run = display_draw;
     }
     bind_prepared = used_prepared;
     motion_draw = pipeline->GetGraphicsKey().motion_vectors;
@@ -1323,7 +1328,17 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // commands are recorded after BeginRendering, as before).
     draw_inputs = {pipeline, draw_prepared, index_offset, is_indexed, true, false};
     current_vs_hash = u32(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash);
+    if (scene_targets->report_native_writes) {
+        // (hi-res output: which pass writes an enlarged image natively)
+        const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        scene_targets->current_shader = ps ? ps->pgm_hash : current_vs_hash;
+    }
+    hudless_probe = {upscaler->WantsHudlessProbe(), 0, 0};
     const bool bound = BindResources(pipeline);
+    if (hudless_probe.active) {
+        upscaler->OnHudlessInputs(hudless_probe.proxies, hudless_probe.native);
+        hudless_probe.active = false;
+    }
     bind_prepared = nullptr; // indirect draws and dispatches bind without prepared sharps
     const bool inputs_resolved = draw_inputs.resolved;
     draw_inputs.pending = false;
@@ -1331,6 +1346,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         return;
     }
     const auto state = BeginRendering(pipeline);
+    if (upscaler->InProbeWindow()) {
+        ProbeDraw(pipeline);
+    }
 
     if (!inputs_resolved) {
         ResolveVertexBuffers(pipeline, draw_prepared);
@@ -1689,12 +1707,18 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     // Indirect arguments may be GPU-written: leave these draws on camera fallback.
     motion_draw = false;
     motion_geometry = 0;
+    display_run = false; // (hi-res output: not a display draw)
     PrepareRenderState(pipeline);
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
                          cb_descs[0].first, db_desc.first,
                          UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2));
+    }
+    if (scene_targets->report_native_writes) {
+        const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        scene_targets->current_shader =
+            ps ? ps->pgm_hash : pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash;
     }
     if (!BindResources(pipeline)) {
         return;
@@ -1819,6 +1843,10 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     if (upscaler->Enabled()) {
         upscaler->OnDispatch(cs.pgm_hash);
     }
+    display_run = false; // (hi-res output: not a display draw)
+    if (scene_targets->report_native_writes) {
+        scene_targets->current_shader = cs.pgm_hash; // (which pass writes an enlarged image)
+    }
     if (ExecuteShaderHLE(cs, Regs(), cs_program, *this)) {
         return;
     }
@@ -1859,6 +1887,9 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
     if (!BindResources(pipeline)) {
         return;
+    }
+    if (upscaler->InProbeWindow()) {
+        ProbeDispatch(cs, cs_program);
     }
     if (StaleCheckEnabled()) {
         VAddr slot = ~VAddr{0};
@@ -2052,6 +2083,10 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     scheduler.PopPendingOperations();
     const u32 offset = 0;
 
+    display_run = false; // (hi-res output: not a display draw)
+    if (scene_targets->report_native_writes) {
+        scene_targets->current_shader = pipeline->GetStage(Shader::SwStage::Compute).pgm_hash;
+    }
     if (!BindResources(pipeline)) {
         return;
     }
@@ -2165,6 +2200,9 @@ bool Rasterizer::HelperEligible(const Pipeline* pipeline) const {
 
 bool Rasterizer::TexturesBindableOnHelper(const Shader::Info& stage,
                                           const PreparedStage* prepared) {
+    if (hudless_probe.active) {
+        return false; // the probe counts the proxies and native images on the main path
+    }
     const u64 generation = texture_cache.RegistryGeneration();
     for (u32 image_index = 0; image_index < stage.images.size(); ++image_index) {
         const auto& image_desc = stage.images[image_index];
@@ -3275,8 +3313,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                                                    desc.view_info.range, true};
                     }
                     ++proxy_samples;
+                    if (hudless_probe.active) ++hudless_probe.proxies;
                     continue;
                 }
+            }
+            if (hudless_probe.active && !is_storage && !image.info.props.is_depth &&
+                image.info.size.width == 1920 && image.info.size.height == 1080) {
+                ++hudless_probe.native; // (hi-res output: a native 1080p input of the HUD-less pass)
             }
             // The image is either bound as storage in a separate descriptor or bound as render
             // target in feedback loop. Depth images are excluded because they can't be bound as
@@ -3410,7 +3453,8 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
                                      u32 first_image_idx, bool& barrier, TextureSet*& slot) {
     const u32 count = static_cast<u32>(stage.images.size());
     if (!prepared || count == 0 || count > TextureSet::MaxImages ||
-        BbToggle::Disabled(BbToggle::TextureSetMemo) || FrameCapture::Active()) {
+        BbToggle::Disabled(BbToggle::TextureSetMemo) || FrameCapture::Active() ||
+        hudless_probe.active) {
         return false;
     }
     for (const auto& image : stage.images) {
@@ -3566,10 +3610,12 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         scene_targets->EligibleScene(texture_cache.GetImage(db_desc.first))) scene_started = true;
     // A proxy attachment cannot represent MSAA or a feedback loop that reads the
     // same image through the guest's native descriptor during this draw.
-    bool reduced = scene_started && upscaler->RasterScaling() && key.num_samples == 1;
+    // (Hi-res output: Uncharted has no G-buffer pass; the post passes after the upscale start it.)
+    bool reduced = (scene_started || upscaler->HiResPostPhase()) && upscaler->RasterScaling() &&
+                   key.num_samples == 1;
     // BB_SCENE_DEBUG=<file>: once the file exists, why the passes of one frame keep the
     // native size (see NoteFrameStart).
-    const bool debug_pass = scene_debug_frame && scene_started;
+    const bool debug_pass = scene_debug_frame && (scene_started || upscaler->HiResPostPhase());
     std::string why;
     if (debug_pass) {
         why = fmt::format("pass vs {:08x} ps {:08x} mrt {:#x} samples {} raster_scaling {}:",
@@ -3834,6 +3880,12 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             target_scale = UiComposition::Scale(guest_extent.first, guest_extent.second,
                                                 redirect.width, redirect.height,
                                                 native_coordinates);
+            if (color_redirected && upscaler->HiResDisplay() && guest_extent.first == 1920 &&
+                guest_extent.second == 1080) {
+                // The display pass rasterizes at the output size; its shaders address 1920x1080.
+                push_data.scene_size =
+                    SceneResolution::Pack(SceneResolution::Size{redirect.width, redirect.height});
+            }
         }
     }
 
@@ -4517,6 +4569,72 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
                                          : std::string{"-"},
                            vs.pgm_hash, ps ? ps->pgm_hash : 0);
     });
+}
+
+// bbport: BB_HIRES_PROBE (TemporalUpscaler::InProbeWindow). The images a shader binds as
+// "<w>x<h>/<data format>" ("w " before one it writes, "!" after one it reads other than by
+// normalized sampling: that needs the native-size image).
+static std::string ProbeImages(const Shader::Info& stage) {
+    std::string text;
+    for (const auto& desc : stage.images) {
+        const auto t = desc.GetSharp(stage);
+        if (t.Address() == 0) {
+            continue;
+        }
+        text += fmt::format("{}{}x{}/{}{} ", desc.is_written ? "w " : "", u32(t.width) + 1,
+                            u32(t.height) + 1, u32(t.data_format), desc.needs_native ? "!" : "");
+    }
+    return text.empty() ? std::string{"-"} : text;
+}
+
+// One line per pass between the upscale and the display draw of a probed frame: a draw with
+// the same pixel shader and targets as the line before is not printed again.
+void Rasterizer::ProbeDraw(const GraphicsPipeline* pipeline) {
+    if (probe_epoch != upscaler->ProbeEpoch()) {
+        probe_epoch = upscaler->ProbeEpoch();
+        probe_last = 0;
+    }
+    const auto& key = pipeline->GetGraphicsKey();
+    const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    const u32 ps_hash = ps ? u32(ps->pgm_hash) : 0;
+    std::string targets;
+    bool eligible = key.num_samples == 1;
+    u64 identity = ps_hash;
+    const auto add = [&](VideoCore::ImageId id, u32 layer, const char* prefix) {
+        if (!id) {
+            targets += "- ";
+            return;
+        }
+        const auto& image = texture_cache.GetImage(id);
+        const bool ok = scene_targets->Eligible(image) && !image.binding.is_bound &&
+                        !image.binding.needs_rebind && layer == 0;
+        eligible = eligible && ok;
+        targets += fmt::format("{}{} {}x{}{} ", prefix, vk::to_string(image.info.pixel_format),
+                               image.info.size.width, image.info.size.height, ok ? "" : "!");
+        identity = identity * 31 + id.index;
+    };
+    const u32 num_color = std::bit_width(key.mrt_mask);
+    for (u32 cb = 0; cb < num_color && cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        add(cb_descs[cb].first, cb_descs[cb].second.view_info.range.base.layer, "");
+    }
+    if (db_desc.first) {
+        add(db_desc.first, 0, "depth ");
+    }
+    if (identity == probe_last) {
+        return;
+    }
+    probe_last = identity;
+    const char* result = push_data.scene_size ? "enlarged"
+                         : eligible && num_color + (db_desc.first ? 1 : 0) > 0 ? "native (would enlarge)"
+                                                                               : "native";
+    std::printf("Hi-res probe: graphics ps %08x vs %08x targets [%s] reads [%s] eligible %d -> %s\n",
+                ps_hash, u32(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash), targets.c_str(),
+                ps ? ProbeImages(*ps).c_str() : "-", int(eligible), result);
+}
+
+void Rasterizer::ProbeDispatch(const Shader::Info& cs, const AmdGpu::ComputeProgram& program) {
+    std::printf("Hi-res probe: compute %08x groups %ux%ux%u images [%s]\n", u32(cs.pgm_hash),
+                program.dim_x, program.dim_y, program.dim_z, ProbeImages(cs).c_str());
 }
 
 void Rasterizer::NoteFrameStart() {

@@ -17,6 +17,7 @@
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "ffx_vk_portable.h"
+#include "video_core/host_shaders/upscale_hires_comp.h"
 #include "video_core/host_shaders/upscale_merge_comp.h"
 #include "video_core/host_shaders/upscale_reactive_comp.h"
 #include "video_core/host_shaders/taa_comp.h"
@@ -204,6 +205,47 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
             render_height = h;
         }
     }
+    // Hi-res output (BB_HIRES_OUTPUT, Uncharted): the guest stays at 1920x1080; the upscaler
+    // reconstructs it at the output size and the game's post-processing and HUD follow there.
+    // BB_HIRES_PROBE=1 only prints what the game does between the upscale and the display pass.
+    {
+        const auto& s = BbSettings::Get();
+        const auto env_on = [](const char* name) {
+            const char* value = std::getenv(name);
+            return value && value[0] == '1';
+        };
+        probe = env_on("BB_HIRES_PROBE");
+        probe_trigger_file = std::getenv("BB_HIRES_PROBE_TRIGGER");
+        if (probe) {
+            std::printf("Hi-res probe: on (frames 240 and 1200 of the upscale trigger%s)\n",
+                        probe_trigger_file ? ", and when BB_HIRES_PROBE_TRIGGER exists" : "");
+        }
+        hires_session = s.hires_width && s.hires_height && camera_motion.VelocityMode() &&
+                        !scaled_session;
+        if (hires_session) {
+            hires_width = u32(s.hires_width);
+            hires_height = u32(s.hires_height);
+            display_check = !(std::getenv("BB_HIRES_DISPLAY_CHECK") &&
+                              std::strcmp(std::getenv("BB_HIRES_DISPLAY_CHECK"), "0") == 0);
+            hires_force = env_on("BB_HIRES_FORCE");
+            scene_targets.half_res = env_on("BB_HIRES_HALF_RES");
+            scene_targets.linear_resample = true;
+            scene_targets.max_proxies = 24;
+            if (const char* proxies = std::getenv("BB_HIRES_MAX_PROXIES")) {
+                scene_targets.max_proxies = u32(std::max(0, std::atoi(proxies)));
+            }
+            std::printf("Hi-res output: %ux%u requested, scene stays 1920x1080 (%s)\n", hires_width,
+                        hires_height, scene_targets.half_res ? "960x540 targets enlarged too"
+                                                             : "960x540 targets stay native");
+        } else if (s.hires_width) {
+            HiResOutput::Inputs inputs{.requested = true,
+                                       .velocity_mode = camera_motion.VelocityMode(),
+                                       .fixed_render = scaled_session};
+            std::printf("Hi-res output: not used (%s)\n",
+                        HiResOutput::Describe(HiResOutput::Decide(inputs)));
+        }
+        scene_targets.report_native_writes = hires_session || probe;
+    }
     // Scene depth copied into the output-size UI depth by a blit (depth aspect).
     const auto features = instance.GetPhysicalDevice()
                               .getFormatProperties(vk::Format::eD32SfloatS8Uint)
@@ -242,8 +284,9 @@ bool TemporalUpscaler::Active() const {
 
 bool TemporalUpscaler::ReactiveOn() const {
     // FSR 4 takes no reactive mask: the opaque snapshot and the mask pass would be wasted.
+    // (Hi-res output: its upscale runs at another size than OnBlendedSceneDraw's context.)
     return BbSettings::Get().reactive && !BbToggle::Disabled(1u << 27) && !UseFsr4() && !UseDlss() &&
-           BbSettings::Get().upscaler != BbSettings::UpscalerTaa;
+           BbSettings::Get().upscaler != BbSettings::UpscalerTaa && !hires_on;
 }
 
 void TemporalUpscaler::OnSceneColor(VideoCore::ImageId color) {
@@ -262,10 +305,14 @@ float Halton(u32 index, u32 base) {
 } // namespace
 
 bool TemporalUpscaler::ReducedScene(const VideoCore::Image& color) const {
-    return !scaled_session && scene_targets.Reduced() && scene_targets.EligibleScene(color);
+    // (Hi-res output: the scene is drawn natively and the proxies hold the enlarged post targets.)
+    return !scaled_session && !hires_on && scene_targets.Reduced() &&
+           scene_targets.EligibleScene(color);
 }
 
 bool TemporalUpscaler::RasterScaling() const {
+    // Hi-res output: the scene stays native; only the post passes after the upscale are enlarged.
+    if (hires_session) return hires_post_phase;
     return !scaled_session && scene_targets.Reduced() && !done_this_frame;
 }
 
@@ -311,8 +358,8 @@ bool TemporalUpscaler::OnFrameStart() {
         failed = false;
         fsr4_failed = false;
     }
-    const bool changed = output_changed || applied_preset != preset || active != last_active ||
-                         jitter_on != last_jitter || applied_upscaler != upscaler;
+    bool changed = output_changed || applied_preset != preset || active != last_active ||
+                   jitter_on != last_jitter || applied_upscaler != upscaler;
     if (applied_upscaler != upscaler) {
         // A failed provider keeps a fatal flag internally; a user retry gets a fresh context.
         scheduler.Finish();
@@ -320,16 +367,25 @@ bool TemporalUpscaler::OnFrameStart() {
         if (BbSettings::IsFsr4(upscaler)) BbSettings::Get().fsr4_problem = nullptr;
     }
     if (applied_upscaler != upscaler) fsr4_failed = false; // retry after a menu change
+    if (hires_session) {
+        if (applied_upscaler != upscaler) hires_provider_failed = -1; // a menu change retries
+        changed |= UpdateHiRes(active, upscaler);
+    }
     // Dynamic scene resolution scaling (live preset switching) works on all GPUs.
     // On GPUs without D32S8 blit support, UI depth is cleared instead of copied from scene.
     if (!scaled_session) {
-        scene_targets.SetSize(SceneResolution::ForPreset(active ? preset : 0,
-                                                        {target_width, target_height}));
-        render_width = scene_targets.Size().width;
-        render_height = scene_targets.Size().height;
+        // Hi-res output: the proxies of the post targets have the output size, the scene and
+        // the guest keep 1920x1080.
+        scene_targets.SetSize(hires_on ? SceneResolution::Size{hires_width, hires_height}
+                                       : SceneResolution::ForPreset(active ? preset : 0,
+                                                                    {target_width, target_height}));
+        render_width = hires_on ? 1920 : scene_targets.Size().width;
+        render_height = hires_on ? 1080 : scene_targets.Size().height;
     }
-    BbSettings::Get().active_render_width = Scaled() ? render_width : scene_targets.Size().width;
-    BbSettings::Get().active_render_height = Scaled() ? render_height : scene_targets.Size().height;
+    BbSettings::Get().active_render_width =
+        hires_on ? 1920 : Scaled() ? render_width : scene_targets.Size().width;
+    BbSettings::Get().active_render_height =
+        hires_on ? 1080 : Scaled() ? render_height : scene_targets.Size().height;
     if (changed || !dispatched_last_frame) reset = true;
     if (changed) jitter_index = 0;
     applied_preset = preset;
@@ -341,6 +397,28 @@ bool TemporalUpscaler::OnFrameStart() {
 
     // The display pass of an upscaled frame reads the upscaled UI image.
     display_redirect = ui_phase;
+    if (hires_session) {
+        // The display draws of a frame upscaled at the output size go to the host image; the
+        // HUD-less pass decides that (OnHudlessInputs). Nothing is enlarged until the next upscale.
+        hires_display_pending = hires_display = hires_frame;
+        hires_display_started = false;
+        // The size never changes in this mode, so proxies of render targets a level load
+        // recreated are freed here (about every 5 s at 60 FPS; a GPU wait only when there are).
+        if (hires_on && ++hires_prune_frames >= 300) {
+            hires_prune_frames = 0;
+            scene_targets.PruneStale();
+        }
+        hires_post_phase = false;
+        hires_frame = false;
+        display_redirect = display_redirect || hires_display;
+    }
+    if (probe) {
+        // The display draw ends the probed window; its own input check is printed too.
+        probe_hudless = probe_window;
+        probe_window = false;
+        probe_seen = false;
+        if (probe_hudless) std::printf("Hi-res probe: display draw reached\n");
+    }
     ui_phase = false;
     ui_read_barrier = false;
     done_this_frame = false;
@@ -357,7 +435,8 @@ bool TemporalUpscaler::OnFrameStart() {
     }
     // CameraMotion::OnDisplayPass has already cleared Depth(). Use the context's render
     // size, which survives the frame boundary (Performance 960 -> 1920 needs 32 phases).
-    const u32 phases = Scaled() ? Motion::JitterPhases(render_width, target_width)
+    const u32 phases = hires_on ? Motion::JitterPhases(1920, hires_width)
+        : Scaled() ? Motion::JitterPhases(render_width, target_width)
         : Motion::JitterPhases(scene_targets.Size().width, 1920);
     jitter_index = jitter_index % phases + 1;
     jitter = {Halton(jitter_index, 2) - 0.5f, Halton(jitter_index, 3) - 0.5f};
@@ -374,6 +453,28 @@ void TemporalUpscaler::OnDispatch(u64 cs_hash) {
         !frame_gen_captured) {
         frame_gen_captured = true;
         CaptureFrameGen();
+    }
+    if (probe && !probe_seen) {
+        probe_seen = true;
+        if (ProbeFrameWanted()) {
+            probe_window = true;
+            ++probe_epoch;
+            std::printf("Hi-res probe: frame %u, passes after the upscale trigger (compute shader "
+                        "%016llx) until the first draw into the display buffer; hi-res %s\n",
+                        probe_triggers, static_cast<unsigned long long>(cs_hash),
+                        hires_on ? "on" : "off");
+        }
+    }
+    if (hires_on) {
+        // Hi-res output: the upscale produces the output-size picture (RunHiRes falls back to
+        // the 1080p upscale for a frame whose scene color it cannot take).
+        done_this_frame = true;
+        if (scene_color && camera_motion.Ready()) {
+            RunHiRes();
+        } else {
+            reset = true;
+        }
+        return;
     }
     if (failed || Scaled()) {
         return;
@@ -1258,6 +1359,364 @@ void TemporalUpscaler::Run() {
     }
 }
 
+bool TemporalUpscaler::ProbeFrameWanted() {
+    ++probe_triggers;
+    // Frames 240 and 1200 of the trigger, and with BB_HIRES_PROBE_TRIGGER=<file> a frame
+    // whenever the file exists (polled about every half second, then removed).
+    if (probe_triggers == 240 || probe_triggers == 1200) {
+        return true;
+    }
+    return probe_trigger_file && probe_trigger_file[0] && probe_triggers % 30 == 0 &&
+           std::remove(probe_trigger_file) == 0;
+}
+
+bool TemporalUpscaler::UpdateHiRes(bool active, int upscaler) {
+    if (!hires_memory_checked) {
+        // Once, at the first frame: the output-size images (enlarged proxies, display image,
+        // provider) on top of what the process holds. BB_HIRES_MIN_FREE_MB=<MB> replaces the
+        // estimate (0: no check).
+        hires_memory_checked = true;
+        u64 needed = HiResOutput::EstimateBytes({hires_width, hires_height}) / 4 * 5;
+        if (const char* megabytes = std::getenv("BB_HIRES_MIN_FREE_MB")) {
+            needed = std::strtoull(megabytes, nullptr, 10) << 20;
+        }
+        if (needed && instance.CanReportMemoryUsage()) {
+            const u64 budget = instance.GetDeviceMemoryBudgetNow();
+            const u64 usage = instance.GetDeviceMemoryUsage();
+            const u64 available = budget > usage ? budget - usage : 0;
+            hires_memory_ok = available >= needed;
+            std::printf("Hi-res output: %ux%u needs ~%llu MB, %llu MB free\n", hires_width,
+                        hires_height, static_cast<unsigned long long>(needed >> 20),
+                        static_cast<unsigned long long>(available >> 20));
+        }
+    }
+    HiResOutput::Inputs inputs;
+    inputs.requested = true;
+    inputs.velocity_mode = camera_motion.VelocityMode();
+    inputs.fixed_render = scaled_session;
+    // Stage 1: DLSS and FSR 3.1. FSR 4 is not offered at the output size yet.
+    inputs.provider_supported = UseDlss() || upscaler == BbSettings::UpscalerFsr3;
+    inputs.active = active;
+    inputs.toggle_off = BbToggle::Disabled(BbToggle::HiResOutput);
+    inputs.memory_ok = hires_memory_ok;
+    inputs.fsr4_assets_ok = true;
+    inputs.provider_failed = hires_provider_failed == upscaler;
+    // Stage 1: frame generation takes the 1080p display buffer (stage 2 feeds it the output-size one).
+    inputs.frame_gen_wanted = frame_generator && frame_generator->Wanted();
+    inputs.chain_failed = chain.Failed() && !hires_force;
+    const auto reason = HiResOutput::Decide(inputs);
+    const bool on = reason == HiResOutput::Reason::None;
+    if (on != hires_on || reason != hires_reason) {
+        if (on) {
+            std::printf("Hi-res output: active %ux%u (%s, scale %.2f, jitter phases %u)\n",
+                        hires_width, hires_height, BbSettings::UpscalerName(upscaler),
+                        double(hires_width) / 1920.0, Motion::JitterPhases(1920, hires_width));
+        } else {
+            std::printf("Hi-res output: inactive (%s); 1080p with presenter scaling\n",
+                        HiResOutput::Describe(reason));
+        }
+        BbSettings::Get().hires_active = on;
+        BbSettings::Get().hires_status = HiResOutput::Describe(reason);
+    }
+    const bool toggled = on != hires_on;
+    hires_on = on;
+    hires_reason = reason;
+    return toggled;
+}
+
+void TemporalUpscaler::HiResFailed(const char* what) {
+    // The provider stays selected: the 1080p path (Run) keeps using it, as before this mode.
+    std::printf("Hi-res output: %s failed at %ux%u; the upscaler runs at 1080p from now on\n", what,
+                hires_width, hires_height);
+    hires_provider_failed = BbSettings::Get().upscaler.load();
+    reset = true;
+}
+
+void TemporalUpscaler::CreateHiResPipeline() {
+    if (hires_pipeline) {
+        return;
+    }
+    const auto device = instance.GetDevice();
+    // The upscaled picture (sampled, linear), the native scene color and the enlarged proxy.
+    std::array<vk::DescriptorSetLayoutBinding, 3> bindings{};
+    for (u32 i = 0; i < bindings.size(); ++i) {
+        bindings[i] = {.binding = i,
+                       .descriptorType = i == 0 ? vk::DescriptorType::eCombinedImageSampler
+                                                : vk::DescriptorType::eStorageImage,
+                       .descriptorCount = 1,
+                       .stageFlags = vk::ShaderStageFlagBits::eCompute};
+    }
+    hires_desc_layout = Check(device.createDescriptorSetLayoutUnique({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+        .bindingCount = u32(bindings.size()),
+        .pBindings = bindings.data(),
+    }));
+    const vk::PushConstantRange push{.stageFlags = vk::ShaderStageFlagBits::eCompute,
+                                     .offset = 0,
+                                     .size = sizeof(u32)};
+    hires_pipeline_layout = Check(device.createPipelineLayoutUnique({
+        .setLayoutCount = 1,
+        .pSetLayouts = &*hires_desc_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push,
+    }));
+    hires_sampler = Check(device.createSamplerUnique({
+        .magFilter = vk::Filter::eLinear, .minFilter = vk::Filter::eLinear,
+        .mipmapMode = vk::SamplerMipmapMode::eNearest,
+        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeW = vk::SamplerAddressMode::eClampToEdge}));
+    const auto module = CompileSPV(UPSCALE_HIRES_COMP, device);
+    hires_pipeline = Check(device.createComputePipelineUnique(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                          .module = module,
+                          .pName = "main"},
+                .layout = *hires_pipeline_layout,
+            }));
+    device.destroyShaderModule(module);
+}
+
+void TemporalUpscaler::RunHiRes() {
+    if (auto* profiler = GpuProfiler::Get()) {
+        profiler->Mark(0xF5A2'0000ull, [] { return std::string{"upscaler RunHiRes"}; });
+    }
+    auto& color = texture_cache.GetImage(scene_color);
+    auto& depth = texture_cache.GetImage(camera_motion.Depth());
+    const u32 w = color.info.size.width, h = color.info.size.height;
+    const u32 ow = hires_width, oh = hires_height;
+    if (color.info.pixel_format != vk::Format::eR16G16B16A16Sfloat || depth.info.size.width != w ||
+        depth.info.size.height != h || !(color.usage_flags & vk::ImageUsageFlagBits::eStorage) ||
+        !scene_targets.EligibleScene(color)) {
+        // This frame's scene color cannot take the output-size path: Native AA at 1080p.
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            std::printf("Hi-res output: scene color %s %ux%u (depth %ux%u) cannot be upscaled at "
+                        "the output size; Native AA at 1080p for such frames\n",
+                        vk::to_string(color.info.pixel_format).c_str(), w, h,
+                        depth.info.size.width, depth.info.size.height);
+        }
+        Run();
+        return;
+    }
+    if (!EnsureResources(w, h, ow, oh, true)) {
+        HiResFailed("upscaler context");
+        return;
+    }
+    CreateHiResPipeline();
+    const auto depth_format = depth.info.pixel_format;
+    const auto depth_view = CachedView(depth, depth_format, vk::ImageAspectFlagBits::eDepth);
+    const auto color_view =
+        CachedView(color, vk::Format::eR16G16B16A16Sfloat, vk::ImageAspectFlagBits::eColor);
+
+    scheduler.EndRendering();
+    runtime.Transit(&depth, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
+                    vk::AccessFlagBits2::eShaderRead);
+    runtime.Transit(&color, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
+                    vk::AccessFlagBits2::eShaderRead);
+    runtime.FlushBarriers();
+    const auto cmdbuf = scheduler.CommandBuffer();
+
+    const auto own_barrier = [&](vk::Image image, vk::ImageLayout old_layout,
+                                 vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+                                 vk::ImageLayout new_layout, vk::PipelineStageFlags2 dst_stage,
+                                 vk::AccessFlags2 dst_access) {
+        const vk::ImageMemoryBarrier2 barrier{
+            .srcStageMask = src_stage,
+            .srcAccessMask = src_access,
+            .dstStageMask = dst_stage,
+            .dstAccessMask = dst_access,
+            .oldLayout = old_layout,
+            .newLayout = new_layout,
+            .image = image,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        };
+        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+    };
+    const auto all = vk::PipelineStageFlagBits2::eAllCommands;
+    const auto rw = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+    // Previous contents are not needed: the layouts start from undefined every frame.
+    own_barrier(vk::Image(motion_image), vk::ImageLayout::eUndefined, all,
+                vk::AccessFlagBits2::eNone, vk::ImageLayout::eGeneral,
+                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite);
+    own_barrier(vk::Image(output_image), vk::ImageLayout::eUndefined, all,
+                vk::AccessFlagBits2::eNone, vk::ImageLayout::eGeneral, all, rw);
+    // The 1080p scene's motion; the upscaler reads it at the scene's size.
+    camera_motion.RecordVelocity(cmdbuf, depth_view, *motion_view, w, h);
+    own_barrier(vk::Image(motion_image), vk::ImageLayout::eGeneral,
+                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+                vk::ImageLayout::eGeneral, all, vk::AccessFlagBits2::eShaderRead);
+
+    const auto now = std::chrono::steady_clock::now();
+    float frame_ms = std::chrono::duration<float, std::milli>(now - last_frame).count();
+    if (frame_ms <= 0.0f || frame_ms > 200.0f) {
+        frame_ms = 16.6f;
+    }
+    last_frame = now;
+
+    bool dispatched = false;
+    const char* provider = "FSR 3.1";
+    hires_recording = true;
+    if (UseDlss()) {
+        provider = "DLSS";
+        dispatched = RecordDlss(
+            cmdbuf,
+            {color.GetImage(), color_view, color.info.pixel_format, vk::ImageAspectFlagBits::eColor, w, h},
+            {depth.GetImage(), depth_view, depth_format, vk::ImageAspectFlagBits::eDepth, w, h}, w, h,
+            ow, oh, frame_ms, true);
+    } else {
+        FfxVkPortableUpscaleDispatchInfo info{};
+        info.structSize = sizeof(info);
+        info.commandBuffer = cmdbuf;
+        info.color = Describe(color.GetImage(), color.info.pixel_format, w, h, color.usage_flags,
+                              vk::ImageAspectFlagBits::eColor,
+                              FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
+        info.depth = Describe(depth.GetImage(), depth_format, w, h, depth.usage_flags,
+                              vk::ImageAspectFlagBits::eDepth,
+                              FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
+        info.motionVectors = Describe(vk::Image(motion_image), vk::Format::eR16G16Sfloat, w, h,
+                                      vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
+                                      vk::ImageAspectFlagBits::eColor,
+                                      FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
+        info.output = Describe(vk::Image(output_image), vk::Format::eR16G16B16A16Sfloat, ow, oh,
+                               vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+                                   vk::ImageUsageFlagBits::eTransferSrc,
+                               vk::ImageAspectFlagBits::eColor,
+                               FFX_VK_PORTABLE_RESOURCE_STATE_UNORDERED_ACCESS);
+        // Optional inputs, absent: a described but null image (no reactive mask in this mode).
+        info.exposure.structSize = sizeof(info.exposure);
+        info.reactiveMask.structSize = sizeof(info.reactiveMask);
+        info.transparencyAndCompositionMask.structSize = sizeof(info.transparencyAndCompositionMask);
+        const float sign = BbToggle::Disabled(1u << 26) ? -1.0f : 1.0f;
+        info.jitterOffset = {sign * jitter[0], sign * jitter[1]};
+        info.motionVectorScale = {1.0f, 1.0f};
+        info.renderSize = {w, h};
+        info.outputSize = {ow, oh};
+        info.frameTimeMilliseconds = frame_ms;
+        info.preExposure = 1.0f;
+        info.cameraNear = camera_motion.Near();
+        info.cameraFar = 10000.0f;
+        info.cameraVerticalFovRadians = camera_motion.VerticalFov();
+        info.viewSpaceToMeters = 1.0f;
+        info.sharpness = std::min(BbSettings::Get().sharpness.load(), 1.0f);
+        info.enableSharpening = BbSettings::Get().sharpen ? VK_TRUE : VK_FALSE;
+        info.reset = reset ? VK_TRUE : VK_FALSE;
+        info.frameId = frame_id++;
+
+        FfxVkPortableUpscaleCreateInfo create_info{};
+        create_info.structSize = sizeof(create_info);
+        create_info.flags = FFX_VK_PORTABLE_CONTEXT_HDR_COLOR_INPUT | FFX_VK_PORTABLE_CONTEXT_AUTO_EXPOSURE;
+        create_info.maxRenderSize = {w, h};
+        create_info.maxOutputSize = {ow, oh};
+        if (const u64 issues = ffxVkPortableValidateUpscaleDispatchInfo(&create_info, &info)) {
+            static bool printed = false;
+            if (!printed) {
+                printed = true;
+                PrintIssues("hi-res dispatch", issues);
+            }
+        } else if (ffxVkPortableUpscaleContextRecordDispatch(context, &info) != FFX_VK_PORTABLE_OK) {
+            std::printf("Upscaler: FSR 3 hi-res dispatch failed\n");
+        } else {
+            dispatched = true;
+        }
+    }
+    hires_recording = false;
+    if (!dispatched) {
+        // This frame stays un-upscaled; the next ones run at 1080p with the same provider.
+        HiResFailed(provider);
+        return;
+    }
+    reset = false;
+    dispatched_last_frame = true;
+    ExtraSharpen(cmdbuf, vk::Image(output_image), false, ow, oh);
+    if (const int dump = DumpFrame(); dump >= 0) {
+        DumpImages(instance, scheduler, cmdbuf, dump,
+                   {{color.GetImage(), w, h, 8, "input", "rgba16f"},
+                    {vk::Image(motion_image), w, h, 4, "motion", "rg16f"},
+                    {vk::Image(output_image), ow, oh, 8, "output", "rgba16f"}});
+        DumpImages(instance, scheduler, cmdbuf, dump,
+                   {{depth.GetImage(), w, h, 4, "depth", "f32", vk::ImageAspectFlagBits::eDepth}});
+    }
+    static bool debug_reported = false;
+    if (BbSettings::Get().debug_view != BbSettings::DebugNone && !debug_reported) {
+        debug_reported = true;
+        std::printf("Hi-res output: the debug views are not shown at the output size\n");
+    }
+
+    // The picture is read by the two passes below (a sampled image in General layout).
+    own_barrier(vk::Image(output_image), vk::ImageLayout::eGeneral, all, rw,
+                vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
+                vk::AccessFlagBits2::eShaderRead);
+    const auto dispatch_pass = [&](vk::CommandBuffer cmd, u32 mode, vk::ImageView proxy_view,
+                                   u32 groups_w, u32 groups_h) {
+        const vk::DescriptorImageInfo picture_info{.sampler = *hires_sampler,
+                                                   .imageView = *output_view,
+                                                   .imageLayout = vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo scene_info{.imageView = color_view,
+                                                 .imageLayout = vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo proxy_info{.imageView = proxy_view,
+                                                 .imageLayout = vk::ImageLayout::eGeneral};
+        const std::array<vk::WriteDescriptorSet, 3> writes = {{
+            {.dstBinding = 0,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+             .pImageInfo = &picture_info},
+            {.dstBinding = 1,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage,
+             .pImageInfo = &scene_info},
+            {.dstBinding = 2,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage,
+             .pImageInfo = &proxy_info},
+        }};
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *hires_pipeline);
+        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *hires_pipeline_layout, 0,
+                                 writes);
+        cmd.pushConstants(*hires_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                          sizeof(mode), &mode);
+        cmd.dispatch((groups_w + 7) / 8, (groups_h + 7) / 8, 1);
+    };
+    // Mode 0: every native reader of the scene color (compute, half-resolution, bloom) sees an
+    // anti-aliased 1080p scene. The native image is written: its proxy, if any, is dropped (not
+    // an attribution of a guest shader).
+    const bool report = scene_targets.report_native_writes;
+    scene_targets.report_native_writes = false;
+    runtime.Transit(&color, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
+                    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+    scene_targets.report_native_writes = report;
+    runtime.FlushBarriers();
+    // The output image stands in as the unused proxy binding (the same format).
+    dispatch_pass(cmdbuf, 0, *output_view, w, h);
+
+    // Mode 1: the picture itself, with the native alpha, in the scene color's enlarged proxy.
+    VideoCore::ImageViewInfo adopt_info;
+    adopt_info.format = color.info.pixel_format;
+    const auto proxy = scene_targets.AdoptWrite(scene_color, adopt_info);
+    if (!proxy) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            std::printf("Hi-res output: the scene color has no enlarged proxy; its post-processing "
+                        "stays at 1080p\n");
+        }
+        return;
+    }
+    // (Record and direct recording share the command buffer; fetch it again after the proxy.)
+    const auto cmd = scheduler.CommandBuffer();
+    const vk::MemoryBarrier2 native_written{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead,
+    };
+    cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &native_written});
+    dispatch_pass(cmd, 1, proxy->view, ow, oh);
+    scene_targets.MarkAdopted(scene_color);
+    hires_post_phase = hires_frame = true;
+}
+
 void TemporalUpscaler::CaptureFrameGen() {
     if (!camera_motion.Depth()) {
         return;
@@ -1856,6 +2315,40 @@ vk::ImageView TemporalUpscaler::Mirror(vk::Image image, std::vector<MirrorView>&
     return handle;
 }
 
+void TemporalUpscaler::OnHudlessInputs(u32 proxies, u32 native_fullres) {
+    // The first draw into the display buffer of a frame: the game's finished picture. It only
+    // shows the output-size picture when it was composed from enlarged inputs.
+    const bool probing = probe_hudless;
+    probe_hudless = false;
+    if (probing) {
+        std::printf("Hi-res probe: the first display draw read %u enlarged and %u native 1080p "
+                    "color images\n", proxies, native_fullres);
+    }
+    if (!hires_display_pending) {
+        return;
+    }
+    hires_display_pending = false;
+    const bool ok = HiResOutput::DisplayInputsOk(proxies, native_fullres, display_check);
+    const bool was_failed = chain.Failed();
+    chain.Frame(ok);
+    if (!ok) {
+        hires_display = display_redirect = false;
+    }
+    static u32 reports = 0;
+    static int last = -1;
+    if (reports < 3 || last != int(ok)) {
+        ++reports;
+        last = int(ok);
+        std::printf("Hi-res output: HUD-less pass read %u enlarged, %u native 1080p images -> %s\n",
+                    proxies, native_fullres,
+                    ok ? "display at the output size" : "display stays 1080p (no redirect)");
+    }
+    if (!was_failed && chain.Failed()) {
+        std::printf("Hi-res output: post-processing is not drawn at the output size (see the "
+                    "lines above); falling back to 1080p for this session\n");
+    }
+}
+
 bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
                                      const VideoCore::ImageViewInfo& view_info, Target& target) {
     if (ui_phase && color == ui_color) {
@@ -1866,7 +2359,8 @@ bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
     const auto& image = texture_cache.GetImage(color);
     const VAddr address = image.info.guest_address;
     if (!FrameCapture::IsDisplayBuffer(address)) {
-        display_redirect = false;
+        // (Hi-res output: UI may draw into other targets between its display draws.)
+        if (!hires_display) display_redirect = false;
         return false;
     }
     std::scoped_lock lock{display_mutex};
@@ -1875,21 +2369,25 @@ bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
         display.valid = false; // not upscaled: the presenter shows the guest buffer
         return false;
     }
+    // The host display image has the output size; hi-res output keeps the guest's 1920x1080 as
+    // the target of the other scaled-preset machinery (ui_width / ui_height stay unused then).
+    const u32 display_width = hires_display ? hires_width : ui_width;
+    const u32 display_height = hires_display ? hires_height : ui_height;
     if (!display.image || display.format != image.info.pixel_format ||
-        display.width != ui_width || display.height != ui_height) {
+        display.width != display_width || display.height != display_height) {
         const auto device = instance.GetDevice();
         scheduler.Finish();
         display.views.clear();
-        std::printf("Display: host buffer %ux%u (live)\n", ui_width, ui_height);
+        std::printf("Display: host buffer %ux%u (live)\n", display_width, display_height);
         display.format = image.info.pixel_format;
-        display.width = ui_width;
-        display.height = ui_height;
+        display.width = display_width;
+        display.height = display_height;
         display.image = VideoCore::UniqueImage(device, instance.GetAllocator());
         display.image.Create(vk::ImageCreateInfo{
             .flags = vk::ImageCreateFlagBits::eMutableFormat,
             .imageType = vk::ImageType::e2D,
             .format = display.format,
-            .extent = {ui_width, ui_height, 1},
+            .extent = {display_width, display_height, 1},
             .mipLevels = 1,
             .arrayLayers = 1,
             .samples = vk::SampleCountFlagBits::e1,
@@ -1901,12 +2399,24 @@ bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
         display.views.clear();
     }
     scheduler.EndRendering();
+    // Hi-res output draws several passes into the display image (HUD-less pass, HUD): only the
+    // first of a frame may discard its content (Undefined); later ones continue in General.
+    const bool continued = hires_display && hires_display_started;
+    const vk::PipelineStageFlags2 src_stage = continued
+        ? vk::PipelineStageFlags2(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
+        : vk::PipelineStageFlags2(vk::PipelineStageFlagBits2::eAllCommands);
+    const vk::AccessFlags2 src_access = continued
+        ? vk::AccessFlags2(vk::AccessFlagBits2::eColorAttachmentWrite)
+        : vk::AccessFlags2(vk::AccessFlagBits2::eNone);
+    const vk::AccessFlags2 dst_access = continued
+        ? vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite
+        : vk::AccessFlags2(vk::AccessFlagBits2::eColorAttachmentWrite);
     const vk::ImageMemoryBarrier2 b{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eNone,
+        .srcStageMask = src_stage,
+        .srcAccessMask = src_access,
         .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-        .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
-        .oldLayout = vk::ImageLayout::eUndefined,
+        .dstAccessMask = dst_access,
+        .oldLayout = continued ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined,
         .newLayout = vk::ImageLayout::eGeneral,
         .image = vk::Image(display.image),
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
@@ -1914,9 +2424,10 @@ bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
     scheduler.Record([b](vk::CommandBuffer cmd) {
         cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
     });
+    if (hires_display) hires_display_started = true;
     display.valid = true;
     target = {Mirror(vk::Image(display.image), display.views, view_info.format, {}),
-              vk::ImageLayout::eGeneral, ui_width, ui_height};
+              vk::ImageLayout::eGeneral, display_width, display_height};
     return true;
 }
 
@@ -2083,6 +2594,9 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
             .frame_ms = frame_ms,
             .sharpness = settings.sharpen ? std::min(settings.sharpness.load(), 1.0f) : 0.0f,
         });
+    }
+    if (!ok && hires_recording) {
+        return false; // hi-res output: HiResFailed keeps DLSS selected for the 1080p path
     }
     if (!ok) {
         std::printf("Upscaler: DLSS failed; falling back to FSR 3.1\n");

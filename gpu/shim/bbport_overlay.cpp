@@ -254,6 +254,18 @@ void Menu() {
     }
     ImGui::Text("Активный рендер сцены: %d x %d", s.active_render_width.load(),
                 s.active_render_height.load());
+    if (s.hires_width) {
+        // Hi-res output (BB_HIRES_OUTPUT, Uncharted): chosen in the launcher, started with the game.
+        if (s.hires_active.load()) {
+            ImGui::Text("Вывод %dx%d: DLSS/FSR (сцена 1920x1080)", s.hires_width, s.hires_height);
+        } else {
+            const char* status = s.hires_status.load();
+            ImGui::Text("Вывод %dx%d: выключен (%s)", s.hires_width, s.hires_height,
+                        status ? status : "ожидание кадра");
+        }
+        Hint("Разрешение вывода выбирается в лаунчере (Display, Output resolution). Здесь "
+             "переключатель ниже не действует: сцена остаётся 1920x1080.");
+    }
     if (BbSettings::FixedRenderSession()) {
         ImGui::Text("Пресет при запуске: %s", BbSettings::PresetName(s.startup_preset));
         if (const char* automatic = std::getenv("BB_AUTO_RENDER_RES");

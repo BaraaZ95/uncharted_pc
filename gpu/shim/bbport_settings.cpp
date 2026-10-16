@@ -8,6 +8,8 @@
 #include <string>
 #include <string_view>
 
+#include "../shadps4/video_core/renderer_vulkan/hires_output.h"
+
 namespace BbSettings {
 
 namespace {
@@ -126,6 +128,20 @@ void Load() {
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env)) {
             Set(v, key, value);
+        }
+    }
+    // Hi-res output (Uncharted): from the environment only, never from the file.
+    v.hires_width = v.hires_height = 0;
+    if (const char* env = std::getenv("BB_HIRES_OUTPUT"); env && env[0]) {
+        const char* any = std::getenv("BB_HIRES_ANY");
+        Vulkan::HiResOutput::Size size;
+        if (Vulkan::HiResOutput::Parse(env, size, any && any[0] == '1')) {
+            v.hires_width = int(size.width);
+            v.hires_height = int(size.height);
+            std::printf("Settings: hi-res output %ux%u requested (BB_HIRES_OUTPUT)\n", size.width,
+                        size.height);
+        } else {
+            std::printf("Settings: hi-res output ignored (%s): use 2560x1440 or 3840x2160\n", env);
         }
     }
     v.startup_preset = v.preset;

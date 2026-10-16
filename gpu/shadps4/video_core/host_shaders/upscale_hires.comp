@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: hi-res output (BB_HIRES_OUTPUT). The upscaler's picture is ow x oh; the game's own
+// passes keep reading 1920x1080 images and writing RGB with the game's alpha, which carries data
+// for the post-processing. Mode 0 (dispatched at the native size) writes a filtered downsample of
+// the picture into the native scene color: every native reader sees an anti-aliased 1080p scene.
+// Mode 1 (dispatched at the output size) writes the picture itself into the scene color's
+// enlarged proxy, with the native alpha of that pixel, for the passes drawn at the output size.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D upscaled;               // ow x oh, linear filter
+layout(binding = 1, rgba16f) uniform image2D scene;           // native size
+layout(binding = 2, rgba16f) uniform writeonly image2D proxy; // ow x oh
+
+layout(push_constant) uniform Params {
+    uint mode;
+};
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 native_size = imageSize(scene);
+    if (mode == 0) {
+        if (any(greaterThanEqual(pixel, native_size))) {
+            return;
+        }
+        const vec2 uv = (vec2(pixel) + 0.5) / vec2(native_size);
+        const vec3 color = textureLod(upscaled, uv, 0.0).rgb;
+        imageStore(scene, pixel, vec4(color, imageLoad(scene, pixel).a));
+    } else {
+        const ivec2 proxy_size = imageSize(proxy);
+        if (any(greaterThanEqual(pixel, proxy_size))) {
+            return;
+        }
+        const ivec2 native_pixel = min(pixel * native_size / proxy_size, native_size - 1);
+        const vec3 color = texelFetch(upscaled, pixel, 0).rgb;
+        imageStore(proxy, pixel, vec4(color, imageLoad(scene, native_pixel).a));
+    }
+}

@@ -10,6 +10,7 @@
 #include "video_core/host_shaders/depth_stencil_bits_frag.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
 #include "bbport_toggles.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -70,19 +71,28 @@ bool SceneTargets::ShaderResampled(const VideoCore::Image& image) const {
 // 1 for the scene size, 2 for half resolution (the game's post-processing chain), else 0.
 // Half resolution needs a scene size that halves exactly: the proxy keeps the scene's factor,
 // so the shaders' FragCoord conversion (1920 / scene width) stays correct for it.
-static u32 SizeDivisor(const VideoCore::ImageInfo& i, SceneResolution::Size scene) {
+static u32 SizeDivisor(const VideoCore::ImageInfo& i, SceneResolution::Size scene,
+                       bool half_res) {
     if (i.size.width == 1920 && i.size.height == 1080) return 1;
     if (i.size.width == 960 && i.size.height == 540 && scene.width % 2 == 0 &&
-        scene.height % 2 == 0 && !BbToggle::Disabled(BbToggle::SceneHalfRes)) {
+        scene.height % 2 == 0 && half_res && !BbToggle::Disabled(BbToggle::SceneHalfRes)) {
         return 2;
     }
     return 0;
 }
 bool SceneTargets::Eligible(const VideoCore::Image& image) const {
     const auto& i = image.info;
-    const u32 div = SizeDivisor(i, size);
+    const u32 div = SizeDivisor(i, size, half_res);
     if (!div || i.size.depth != 1 || i.resources.layers != 1 || i.num_samples != 1 ||
         i.props.is_block || !image.backing || image.backing->num_samples != 1) {
+        return false;
+    }
+    if (max_proxies && tracked.size() >= max_proxies && !tracked.contains(image.image_uid)) {
+        if (!proxy_cap_reported) {
+            proxy_cap_reported = true;
+            std::printf("Hi-res output: %u enlarged images reached (BB_HIRES_MAX_PROXIES); other "
+                        "targets stay at 1080p\n", max_proxies);
+        }
         return false;
     }
     if (i.resources.levels != 1) {
@@ -96,7 +106,7 @@ bool SceneTargets::EligibleScene(const VideoCore::Image& image) const {
     return image.info.size.width == 1920 && image.info.size.height == 1080 && Eligible(image);
 }
 SceneResolution::Size SceneTargets::ProxySize(const VideoCore::Image& image, u32 level) const {
-    const u32 div = std::max(1u, SizeDivisor(image.info, size));
+    const u32 div = std::max(1u, SizeDivisor(image.info, size, half_res));
     return {std::max(1u, size.width / div >> level), std::max(1u, size.height / div >> level)};
 }
 bool SceneTargets::SetSize(SceneResolution::Size next) {
@@ -108,6 +118,11 @@ bool SceneTargets::SetSize(SceneResolution::Size next) {
     ++generation;
     recent = {};
     size = next;
+    if (linear_resample && size.width > 1920 && size.height > 1080) { // hi-res output session
+        std::printf("Scene resolution: post-processing targets %ux%u (hi-res output)\n",
+                    size.width, size.height);
+        return true;
+    }
     std::printf("Scene resolution: raster %ux%u, half-resolution targets %ux%u, UI 1920x1080 "
                 "(live)\n", size.width, size.height, size.width / 2, size.height / 2);
     return true;
@@ -118,6 +133,38 @@ void SceneTargets::ResolveAll() {
             if (auto* image = lookup(entry->source, entry->uid)) Copy(*entry, *image, true);
         }
     }
+}
+u32 SceneTargets::PruneStale() {
+    std::vector<u64> stale;
+    for (const auto& [key, entry] : entries) {
+        if (!lookup(entry->source, entry->uid)) stale.push_back(key);
+    }
+    if (stale.empty()) return 0;
+    scheduler.Finish(); // no command buffer can still reference these images/views
+    for (const u64 key : stale) entries.erase(key);
+    tracked.clear();
+    for (const auto& [key, entry] : entries) tracked.insert(entry->uid);
+    ++generation; // memoized texture sets hold views of the freed proxies
+    recent = {};
+    proxy_cap_reported = false;
+    std::printf("Scene resolution: freed %zu proxies of destroyed images, %zu left\n",
+                stale.size(), entries.size());
+    return u32(stale.size());
+}
+void SceneTargets::ReportNativeWrite(const VideoCore::Image& image) {
+    // A guest pass wrote the native image of an enlarged proxy: from here its detail is 1080p.
+    // Each (shader, image) pair is printed once, the first 16 only.
+    const std::pair<u64, u64> key{current_shader, image.image_uid};
+    if (native_write_reports.size() >= 16 ||
+        std::find(native_write_reports.begin(), native_write_reports.end(), key) !=
+            native_write_reports.end()) {
+        return;
+    }
+    native_write_reports.push_back(key);
+    std::printf("Hi-res output: shader %08x wrote enlarged %s %ux%u natively; its detail is 1080p "
+                "from here\n", u32(current_shader),
+                vk::to_string(image.info.pixel_format).c_str(), image.info.size.width,
+                image.info.size.height);
 }
 void SceneTargets::NativeAccess(VideoCore::Image& image, vk::AccessFlags2 access) {
     if (copying || !image.scene_proxy) return; // most images never had a proxy
@@ -130,7 +177,10 @@ void SceneTargets::NativeAccess(VideoCore::Image& image, vk::AccessFlags2 access
         if (it == entries.end()) continue;
         auto& entry = *it->second;
         if (entry.state.dirty) Copy(entry, image, true);
-        if (access & writes) entry.state.NativeWrite();
+        if (access & writes) {
+            if (report_native_writes && entry.state.valid) ReportNativeWrite(image);
+            entry.state.NativeWrite();
+        }
     }
 }
 void SceneTargets::Transition(Entry& e, vk::ImageAspectFlags aspect, vk::ImageLayout layout,
@@ -199,6 +249,14 @@ void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
                               s32(std::max(1u, original.info.size.height >> e.level)), 1};
     const vk::Offset3D reduced{s32(e.image.image_ci.extent.width),
                                s32(e.image.image_ci.extent.height), 1};
+    // Hi-res output: color resamples linearly (the proxy is larger than the native image). Never
+    // for depth/stencil or formats that cannot be filtered (integer ones).
+    const vk::Filter color_filter =
+        linear_resample && !original.info.props.is_depth &&
+                (Features(original.backing->image.image_ci.format) &
+                 vk::FormatFeatureFlagBits::eSampledImageFilterLinear)
+            ? vk::Filter::eLinear
+            : vk::Filter::eNearest;
     for (auto aspect : {vk::ImageAspectFlagBits::eColor, vk::ImageAspectFlagBits::eDepth,
                         vk::ImageAspectFlagBits::eStencil}) {
         if (!(original.aspect_mask & aspect)) continue;
@@ -210,9 +268,11 @@ void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
         };
         // Nearest preserves depth/stencil and avoids assuming linear blit support for
         // integer G-buffer formats. FSR reconstructs color at the HDR scene boundary.
-        scheduler.Record([src,dst,region](vk::CommandBuffer cmd) {
+        const vk::Filter filter = aspect == vk::ImageAspectFlagBits::eColor ? color_filter
+                                                                            : vk::Filter::eNearest;
+        scheduler.Record([src,dst,region,filter](vk::CommandBuffer cmd) {
             cmd.blitImage(src, vk::ImageLayout::eTransferSrcOptimal, dst,
-                          vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
+                          vk::ImageLayout::eTransferDstOptimal, region, filter);
         });
     }
     if (to_native) e.state.Resolved(); else e.state.CopiedToProxy();
@@ -384,13 +444,13 @@ vk::Pipeline SceneTargets::ResamplePipeline(vk::Format format, bool stencil) {
     resample_pipelines.emplace_back(key, std::move(pipeline));
     return result;
 }
-SceneTargets::Entry& SceneTargets::Get(VideoCore::ImageId id, u32 level) {
+SceneTargets::Entry& SceneTargets::Get(VideoCore::ImageId id, u32 level, bool fill) {
     auto& original = *lookup(id, 0);
     const u64 key = Key(original.image_uid, level);
     // A draw has up to six targets, mostly the same as the previous draw's.
     for (const auto& [recent_key, recent_entry] : recent) {
         if (recent_entry && recent_key == key) {
-            if (!recent_entry->state.valid) Copy(*recent_entry, original, false);
+            if (fill && !recent_entry->state.valid) Copy(*recent_entry, original, false);
             return *recent_entry;
         }
     }
@@ -411,7 +471,7 @@ SceneTargets::Entry& SceneTargets::Get(VideoCore::ImageId id, u32 level) {
         tracked.insert(original.image_uid);
     }
     recent[recent_next++ % recent.size()] = {key, entry.get()};
-    if (!entry->state.valid) Copy(*entry, original, false);
+    if (fill && !entry->state.valid) Copy(*entry, original, false);
     return *entry;
 }
 vk::ImageView SceneTargets::View(Entry& e, const VideoCore::Image& original,
@@ -477,6 +537,25 @@ std::optional<SceneTargets::Target> SceneTargets::SampleProxy(
     auto& e = *entries.find(Key(image.image_uid, level))->second;
     const auto layout = PrepareSample(image, level);
     return Target{e.image, View(e, image, info), layout, e.image.image_ci.usage};
+}
+std::optional<SceneTargets::Target> SceneTargets::AdoptWrite(VideoCore::ImageId id,
+                                                              const VideoCore::ImageViewInfo& info) {
+    auto& original = *lookup(id, 0);
+    if (!Eligible(original) ||
+        !(original.backing->image.image_ci.usage & vk::ImageUsageFlagBits::eStorage)) {
+        return std::nullopt;
+    }
+    // The compute pass overwrites every pixel: no fill from the native image.
+    auto& e = Get(id, 0, false);
+    Transition(e, original.aspect_mask, vk::ImageLayout::eGeneral,
+               vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite);
+    return Target{e.image, View(e, original, info), e.layout, e.image.image_ci.usage};
+}
+void SceneTargets::MarkAdopted(VideoCore::ImageId id) {
+    auto& original = *lookup(id, 0);
+    if (const auto it = entries.find(Key(original.image_uid, 0)); it != entries.end()) {
+        it->second->state.CopiedToProxy();
+    }
 }
 SceneTargets::Target SceneTargets::Read(VideoCore::ImageId id,
                                        const VideoCore::ImageViewInfo& info,

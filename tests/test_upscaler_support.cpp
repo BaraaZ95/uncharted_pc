@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <unistd.h>
 #include "bbport_settings.h"
@@ -77,6 +78,46 @@ int main() {
     setenv("BB_RENDER_RES", "", 1);
     assert(!FixedRenderSession() && !ResolutionNeedsRestart());
     unsetenv("BB_RENDER_RES");
+    // Hi-res output (BB_HIRES_OUTPUT) comes from the environment only and is never saved.
+    unsetenv("BB_HIRES_OUTPUT");
+    unsetenv("BB_HIRES_ANY");
+    {
+        FILE* config = std::fopen(path, "w");
+        assert(config);
+        std::fputs("hires_width=2560\nhires_height=1440\nhires_output=2560x1440\n", config);
+        std::fclose(config);
+    }
+    Load();
+    assert(s.hires_width == 0 && s.hires_height == 0);
+    setenv("BB_HIRES_OUTPUT", "3840x2160", 1);
+    Load();
+    assert(s.hires_width == 3840 && s.hires_height == 2160);
+    setenv("BB_HIRES_OUTPUT", "1920x1080", 1);
+    Load();
+    assert(s.hires_width == 0 && s.hires_height == 0);
+    setenv("BB_HIRES_OUTPUT", "2000x1200", 1);
+    Load();
+    assert(s.hires_width == 0);
+    setenv("BB_HIRES_ANY", "1", 1);
+    Load();
+    assert(s.hires_width == 2000 && s.hires_height == 1200);
+    unsetenv("BB_HIRES_ANY");
+    setenv("BB_HIRES_OUTPUT", "2560x1440", 1);
+    Load();
+    assert(s.hires_width == 2560 && s.hires_height == 1440);
+    Save();
+    {
+        FILE* config = std::fopen(path, "r");
+        assert(config);
+        char text[4096];
+        const size_t length = std::fread(text, 1, sizeof(text) - 1, config);
+        text[length] = '\0';
+        std::fclose(config);
+        assert(length > 0 && !std::strstr(text, "hires") && !std::strstr(text, "HIRES"));
+    }
+    unsetenv("BB_HIRES_OUTPUT");
+    Load();
+    assert(s.hires_width == 0 && s.hires_height == 0);
     std::remove(path);
     std::puts("Upscaler support: saved choices and FSR 3.1 fallback PASS");
 }

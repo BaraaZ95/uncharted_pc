@@ -1,5 +1,81 @@
 # Temporal upscaling and frame generation — frame analysis and plan
 
+## Hi-res output (`BB_HIRES_OUTPUT`, Uncharted, experimental)
+
+The games render 1920x1080 and the port normally shows that picture scaled to the window. With
+`BB_HIRES_OUTPUT=2560x1440` (launcher: Display, Output resolution, with DLSS or FSR 3 anti-aliasing)
+DLSS / FSR 3.1 reconstruct the 1080p scene at the output size and the game's own post-processing and
+HUD are drawn at that size, so effects, text and edges are sharp instead of stretched.
+Nothing changes without the variable. Status: stage 1 (2560x1440, DLSS and FSR 3.1, frame
+generation off). Not done yet: frame generation (stage 2), FSR 4 and 3840x2160 in the launcher
+(stage 3); `BB_HIRES_ANY=1` lets testers try 3840x2160 (or any even size 1922..3840 x 1082..2160)
+by hand with DLSS / FSR 3.1.
+
+Per frame (`TemporalUpscaler::RunHiRes`, `vk_temporal_upscaler.cpp`):
+
+1. Scene passes stay native 1920x1080, jittered as in Native AA. The velocity pass (f4b18264)
+   gives the camera as before.
+2. At the trigger dispatch (aec539f0): frame generation's capture is unchanged;
+   the provider reconstructs 1920x1080 -> output size (RGBA16F `output_image`), RCAS and the extra
+   sharpening follow. `upscale_hires.comp` mode 0 writes a filtered downsample of the picture into
+   the guest's scene color RGB (its alpha is kept), so every native reader (compute, half
+   resolution, bloom) sees an anti-aliased 1080p scene. Mode 1 writes the picture, with the native
+   alpha, into the scene color's output-size proxy (`SceneTargets::AdoptWrite`), current at once.
+3. Post phase (until the first draw into the display buffer): graphics passes whose attachments are
+   all eligible 1920x1080 images are drawn into output-size proxies (`SceneTargets`, viewport and
+   scissor scaled by `target_scale`, `FragCoord` converted back to the 1920x1080 space the shaders
+   address). Normalized samples of images with a current proxy read the proxy. Compute passes run
+   at 1080p: they read a proxy only through the downsampled native image, and a compute write to
+   an enlarged image drops its proxy (logged: "wrote enlarged ... natively"). 960x540 targets stay
+   native unless `BB_HIRES_HALF_RES=1`.
+4. The first display draw (the HUD-less pass, 484cdbf5) checks its inputs
+   (`Rasterizer::BindTextures`): when it read enlarged proxies and no native 1920x1080 color
+   image, the display pass and the HUD draw into an output-size host image (`RedirectColor`,
+   `HiResDisplay`, discarded only by the first pass of the frame). The presenter shows that image
+   (`DisplayOverride`; FSR 1 is a no-op when the input is not smaller than the window). Otherwise the
+   frame is shown as before (1080p, scaled) and the chain monitor counts a failure.
+5. Frames without the trigger (movies, menus) are not redirected, exactly as before.
+
+| Variable | Meaning |
+|---|---|
+| `BB_HIRES_OUTPUT=WxH` | enables: `2560x1440` or `3840x2160` (`BB_HIRES_ANY=1`: any even size 1922..3840 x 1082..2160). From the environment only, never saved to bbport.ini |
+| `BB_HIRES_PROBE=1` | diagnostics, rendering unchanged, works without `BB_HIRES_OUTPUT`: prints the passes between the trigger and the display draw (graphics or compute, targets, eligibility, what would be enlarged, inputs with `!` when they need the native image) and what the HUD-less pass read, for trigger frames 240 and 1200 and, with `BB_HIRES_PROBE_TRIGGER=<file>`, whenever the file exists |
+| `BB_HIRES_HALF_RES=1` | also enlarge 960x540 post targets (default: native) |
+| `BB_HIRES_MAX_PROXIES=N` | most enlarged images (default 24); the rest stay native (logged once) |
+| `BB_HIRES_MIN_FREE_MB=N` | replaces the video memory estimate; 0 skips the check |
+| `BB_HIRES_DISPLAY_CHECK=0` | redirect the display even when the HUD-less pass read native images (testing) |
+| `BB_HIRES_FORCE=1` | no session fallback by the chain monitor (testing) |
+| toggle bit `1 << 56` (`BbToggle::HiResOutput`, `BB_TOGGLE_FILE`) | live A/B: set = the 1080p path |
+
+`BB_UPSCALE_BEFORE_CS`, `BB_HUDLESS_PS` and `BB_VELOCITY_PS` are used unchanged.
+
+Fallbacks (the log says why: "Hi-res output: inactive (...)"; the picture is then Native AA at 1080p
+with presenter scaling): not Uncharted's velocity mode, `BB_RENDER_RES`, anti-aliasing other than
+DLSS / FSR 3.1, the upscaler off or failed, the toggle bit, not enough free video memory (estimate
+logged), frame generation on (stage 1), the provider failed at the output size (it keeps running
+at 1080p), and 120 scene frames in a row whose display pass could not be redirected. A scene color
+the upscaler cannot take for one frame (format, size, no proxy) runs the 1080p upscale for that frame.
+History restarts whenever the state changes.
+
+### In-game verification checklist
+
+- Q1 (decisive): are the post passes between aec539f0 and 484cdbf5 graphics or compute (probe)? If
+  the final combine / tonemap is a compute pass writing a 1080p storage image, the chain breaks
+  every frame and the session falls back by itself.
+- Q2: does aec539f0 itself write the scene color (storage)? Its write would drop the adopted proxy at
+  once ("wrote enlarged ... natively").
+- Q3: do UI draws go straight into the display buffer, how many display passes and draws per
+  frame, and do non-display draws sit between them (that would start a second "frame" and redirect
+  nothing for the rest)? Do display draws have a depth buffer ("pass not redirected" warnings)?
+- Q4: does 484cdbf5 sample normalized or by texel fetch / FragCoord?
+- Q5: do post passes depth-test against the scene D32S8 (on NVIDIA no shader stencil export, so
+  depth proxies are not eligible)?
+- Q6: edge alignment where half-resolution or bloom chains mix with enlarged full-resolution passes.
+- Q7: does the guest read the display buffer (pause blur, screenshot)? It holds only the 1080p
+  frame without the HUD-less picture when the host image took the frame.
+- Also: DLSS at the 1.33 ratio, all three games, letterboxed cutscenes, HDR swapchains, video memory
+  and out-of-memory handling at 2560x1440 and 3840x2160.
+
 ## Uncharted: The Nathan Drake Collection (2026-10-10)
 
 All three games share the post-processing of the collection, so one set of shaders serves them
