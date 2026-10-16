@@ -48,6 +48,7 @@ uint64_t runtime_process_time_counter(void);
 uint64_t runtime_tsc_frequency(void);
 int32_t* runtime_errno(void);
 void runtime_memory_set_gpu_hooks(RuntimeGpuRange map, RuntimeGpuRange unmap, RuntimeGpuRange invalidate);
+void runtime_memory_set_gpu_access(void (*access)(uintptr_t address, uint64_t size, int write));
 }
 
 Frontend::WindowSDL* g_window = nullptr;
@@ -101,6 +102,19 @@ void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
         [](uintptr_t address, uint64_t size) {
             Memory::Instance()->GetRasterizer()->InvalidateMemory(address, size);
         });
+    // Kernel copies into and out of guest memory (file reads and writes): the pages that would
+    // fault are resolved as the fault would; anything else costs a look at the page states.
+    runtime_memory_set_gpu_access([](uintptr_t address, uint64_t size, int write) {
+        auto* rasterizer = Memory::Instance()->GetRasterizer();
+        if (!rasterizer->IsWatched(address, size, write != 0)) {
+            return;
+        }
+        if (write) {
+            rasterizer->InvalidateMemory(address, size);
+        } else {
+            rasterizer->ReadMemory(address, size);
+        }
+    });
 }
 void MemoryManager::InvalidateMemory(VAddr address, u64 size) {
     if (rasterizer) rasterizer->InvalidateMemory(address, size);

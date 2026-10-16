@@ -145,6 +145,10 @@ public:
     void CheckConstants();
     u32 current_vs_hash{}; ///< bbport diagnosis: the draw being bound (BB_FORCE_UPLOAD_VS)
     bool IsMapped(VAddr addr, u64 size);
+    /// bbport: whether a page of the range traps that access (PageManager::IsWatched).
+    [[nodiscard]] bool IsWatched(VAddr addr, u64 size, bool write) const {
+        return page_manager.IsWatched(addr, size, write);
+    }
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);

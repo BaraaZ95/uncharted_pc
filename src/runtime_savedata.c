@@ -356,6 +356,15 @@ static ABI int32_t memory_setup(int32_t user, uint64_t size, const Param *param)
     if (!r) printf("Runtime: save data memory ready (%llu bytes)\n",(unsigned long long)size);
     return r;
 }
+/* The guest's buffer through runtime_memory_guest_fill/drain (kernel copies; runtime_memory.c). */
+static int64_t stream_read(void *host, uint64_t size, uint64_t done, void *context) {
+    (void)done;
+    return (int64_t)fread(host,1,size,(FILE *)context);
+}
+static int64_t stream_write(void *host, uint64_t size, uint64_t done, void *context) {
+    (void)done;
+    return (int64_t)fwrite(host,1,size,(FILE *)context);
+}
 static int32_t memory_io(void *buffer, uint64_t size, int64_t offset, int write) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     if (!buffer || offset<0) return ERR_PARAMETER;
@@ -365,7 +374,8 @@ static int32_t memory_io(void *buffer, uint64_t size, int64_t offset, int write)
     FILE *f=fopen(memory_path,"r+b");
     int32_t r=ERR_INTERNAL;
     if (f && !fseek(f,offset,SEEK_SET) &&
-        (write ? fwrite(buffer,1,size,f) : fread(buffer,1,size,f))==size) r=0;
+        (write ? runtime_memory_guest_drain((uintptr_t)buffer,size,stream_write,f)
+               : runtime_memory_guest_fill((uintptr_t)buffer,size,stream_read,f))==(int64_t)size) r=0;
     if (f) fclose(f);
     if (!r && write) ++memory_writes;
     pthread_mutex_unlock(&lock);

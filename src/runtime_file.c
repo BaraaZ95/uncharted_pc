@@ -298,40 +298,45 @@ static ssize_t host_write(int h,const void *buffer,uint64_t size) { return write
 #define host_read read
 #define host_write write
 #endif
-/* Pages of the destination may be write-protected for GPU tracking: the kernel's copy then
- * fails with EFAULT instead of faulting to our handler. A user-mode write to each page first
- * goes through the handler, which unprotects it (and records the upcoming write). */
-static void touch_for_write(void *buffer,uint64_t size) {
-    if (!size) return;
-    uintptr_t p=(uintptr_t)buffer & ~(uintptr_t)4095, end=(uintptr_t)buffer+size;
-    for (; p<end; p+=4096) {
-        volatile unsigned char *b=(volatile unsigned char *)(p<(uintptr_t)buffer ? (uintptr_t)buffer : p);
-        *b=*b;
+/* Guest buffers are moved through runtime_memory_guest_fill/drain: the kernel's copy cannot
+ * take GPU page-tracking faults (runtime_memory.c). A host read or write may also move fewer
+ * bytes than asked without failing (a signal, a 2 GiB CRT call, a pipe); a regular file is
+ * read and written whole, as on the console, so a short count only means end of file. The
+ * standard descriptors (console, pipes) return what one read gives: more could block. */
+typedef struct { int h; int64_t offset; int positional; } HostIo;
+static int64_t read_from_host(void *host,uint64_t size,uint64_t done,void *context) {
+    const HostIo *io=context;
+    uint64_t got=0;
+    while (got<size) {
+        ssize_t n=io->positional ? pread(io->h,(char *)host+got,size-got,io->offset+(int64_t)(done+got))
+                                 : host_read(io->h,(char *)host+got,size-got);
+        if (n<0 && errno==EINTR) continue;
+        if (n<0) return got ? (int64_t)got : -errno;
+        if (!n) break;
+        got+=(uint64_t)n;
+        if (io->h<3) break;
     }
+    return (int64_t)got;
 }
-/* The GPU side can write-protect a destination page again between touch_for_write and the read;
- * the host then stops short (Windows: no error, fewer bytes) and a short read the guest takes as
- * complete loses data (U2's script module: 16384 of 392775 bytes, issue #101; streamed level
- * data). Files are read until the request is done or the file ends, touching the rest again.
- * offset -1: at the file position. */
-static ssize_t read_full(int h,void *buffer,uint64_t size,int64_t offset) {
-    unsigned char *at=buffer;
-    uint64_t done=0;
-    int retries=0;
-    while (done<size) {
-        touch_for_write(at+done,size-done);
-        ssize_t n=offset<0 ? host_read(h,at+done,size-done) : pread(h,at+done,size-done,offset+(int64_t)done);
-        if (n>0) { done+=(uint64_t)n; retries=0; if (h<3) break; continue; }
-        if (n==0) break;
-        if (++retries>8) { if (done) break; return -1; }
+static int64_t write_to_host(void *host,uint64_t size,uint64_t done,void *context) {
+    const HostIo *io=context;
+    uint64_t put=0;
+    while (put<size) {
+        ssize_t n=io->positional ? pwrite(io->h,(const char *)host+put,size-put,io->offset+(int64_t)(done+put))
+                                 : host_write(io->h,(const char *)host+put,size-put);
+        if (n<0 && errno==EINTR) continue;
+        if (n<0) return put ? (int64_t)put : -errno;
+        if (!n) break;
+        put+=(uint64_t)n;
     }
-    return (ssize_t)done;
+    return (int64_t)put;
 }
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
-    ssize_t n=read_full(h,buffer,size,-1);
-    if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
+    HostIo io={h,0,0};
+    const int64_t n=runtime_memory_guest_fill((uintptr_t)buffer,size,read_from_host,&io);
+    if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,(int)-n); return n; }
     trace_bank_read(fd,size,-1,n);
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
@@ -339,8 +344,9 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
-    ssize_t n=read_full(h,buffer,size,offset);
-    if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
+    HostIo io={h,offset,1};
+    const int64_t n=runtime_memory_guest_fill((uintptr_t)buffer,size,read_from_host,&io);
+    if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,(int)-n); return n; }
     trace_bank_read(fd,size,offset,n);
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
@@ -348,16 +354,17 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
 static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
-    ssize_t n=host_write(h,buffer,size);
-    if (n<0) return -errno;
+    HostIo io={h,0,0};
+    const int64_t n=runtime_memory_guest_drain((uintptr_t)buffer,size,write_to_host,&io);
+    if (n<0) return n;
     __atomic_add_fetch(&writes,1,__ATOMIC_RELAXED);
     return n;
 }
 static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
-    ssize_t n=pwrite(h,buffer,size,offset);
-    return n<0 ? -errno : n;
+    HostIo io={h,offset,1};
+    return runtime_memory_guest_drain((uintptr_t)buffer,size,write_to_host,&io);
 }
 static int64_t do_lseek(int fd,int64_t offset,int whence) {
     File *f=get(fd);

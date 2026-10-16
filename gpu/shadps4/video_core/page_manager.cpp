@@ -262,6 +262,18 @@ struct PageManager::Impl {
         release_pending();
     }
 
+    bool IsWatched(VAddr addr, u64 size, bool write) const {
+        const u64 first = addr >> PM_PAGE_BITS;
+        const u64 end = std::min<u64>(Common::DivCeil(addr + size, PM_PAGE_SIZE), cached_pages.size());
+        for (u64 page = first; page < end; ++page) {
+            const PageState& state = cached_pages[page];
+            if (state.num_read_watchers || (write && state.num_write_watchers)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     std::array<PageState, NUM_ADDRESS_PAGES> cached_pages{};
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
     using LockType = Common::AdaptiveMutex;
@@ -448,6 +460,10 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
 }
 
 PageManager::~PageManager() = default;
+
+bool PageManager::IsWatched(VAddr addr, u64 size, bool write) const {
+    return impl->IsWatched(addr, size, write);
+}
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {
     impl->OnMap(address, size);

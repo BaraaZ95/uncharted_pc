@@ -15,6 +15,7 @@ uint64_t runtime_process_time_us() { return std::chrono::duration_cast<std::chro
 int runtime_memory_region(uintptr_t, uintptr_t*, uintptr_t*, int*) { std::abort(); }
 void runtime_memory_set_gpu_hooks(void (*)(uintptr_t, uint64_t),
     void (*)(uintptr_t, uint64_t), void (*)(uintptr_t, uint64_t)) { std::abort(); }
+void runtime_memory_set_gpu_access(void (*)(uintptr_t, uint64_t, int)) { std::abort(); }
 void runtime_thread_attach_host(const char*) {}
 void runtime_memory_gpu_protect(uintptr_t, uint64_t, int, int) { std::abort(); }
 void runtime_restart() { std::abort(); }

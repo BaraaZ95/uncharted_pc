@@ -46,6 +46,12 @@ public:
     template <bool track, bool is_read = false>
     void UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;
 
+    /// bbport: whether a page of [addr, addr + size) traps that access now: writes (a write or
+    /// read watcher: no read access means no access) or reads. A host copy into or out of guest
+    /// memory resolves only then, as the fault would (runtime_memory_guest_fill/drain). Unlocked:
+    /// a page watched while the copy runs is caught by the fill's second check.
+    [[nodiscard]] bool IsWatched(VAddr addr, u64 size, bool write) const;
+
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
         return Common::AlignDown(addr, PM_PAGE_SIZE);

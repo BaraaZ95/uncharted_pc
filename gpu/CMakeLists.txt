@@ -261,6 +261,13 @@ if (WIN32)
     # The PS4 range (64 GiB - 1 TiB) must stay free: no high-entropy ASLR for heaps and stacks.
     # The guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
     target_link_options(bb-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
+    # File I/O into guest memory under GPU page tracking (tests/test_guest_io.c).
+    add_executable(guest-io-test EXCLUDE_FROM_ALL ../tests/test_guest_io.c ${BB_RUNTIME} ../src/compat_win.c)
+    set_target_properties(guest-io-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(guest-io-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    target_include_directories(guest-io-test PRIVATE .. ../src)
+    target_link_libraries(guest-io-test PRIVATE bbgpu atrac9 onecore bcrypt ws2_32 -pthread)
+    target_link_options(guest-io-test PRIVATE -Wl,--disable-high-entropy-va)
     add_executable(bb-gpu-capabilities ../tools/gpu_capabilities.c ../packaging/windows/bb-gpu-capabilities.rc)
     target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan)
     # "Play Bloodborne.exe": the game with the launcher's saved settings, no launcher window.
