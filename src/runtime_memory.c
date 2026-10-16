@@ -86,6 +86,7 @@ static uint64_t flex_bitmap[FLEX_SPAN/PAGE/64];
 /* GPU hooks (bbgpu): notified outside the lock, in order, after each operation. */
 typedef void (*GpuRange)(uintptr_t address, uint64_t size);
 static GpuRange hook_map, hook_unmap, hook_invalidate;
+static GpuRange hook_flush; /* GPU data of a range into guest memory (runtime_memory_guest_drain) */
 enum { HOOK_MAP, HOOK_UNMAP, HOOK_INVALIDATE };
 typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
 static PendingHook *pending; static size_t pending_count, pending_capacity;
@@ -330,7 +331,9 @@ static int split_at(uintptr_t a) {
     if (i==vma_count || vmas[i].start>=a) return 0;
     Vma right=vmas[i];
     right.start=a;
-    if (right.kind==KIND_DIRECT) right.phys+=a-vmas[i].start;
+    /* Direct and flexible memory are both contiguous in the pool: the right part starts later
+     * in it (flexible too, or flex_free/host_discard and the backing view take the left's pages). */
+    if (right.kind!=KIND_RESERVED) right.phys+=a-vmas[i].start;
     vmas[i].end=a;
     return vma_insert(i+1,right);
 }
@@ -674,6 +677,7 @@ uintptr_t runtime_memory_resolve(const char *name) {
     if (!strcmp(name, "L-Q3LEjIbgA#p#J")) return (uintptr_t)direct_map;
     if (!strcmp(name, "MBuItvba6z8#p#J")) return (uintptr_t)direct_release;
     if (!strcmp(name, "cQke9UuBQOk#p#J")) return (uintptr_t)direct_unmap;
+    if (!strcmp(name, "IWIBBdTHit4#p#J")) return (uintptr_t)map_flexible; /* test_guest_io.c */
     return RUNTIME_LOOKUP(exports,name);
 }
 /* Host-owned memory the guest can see (image, stacks, trampolines) lives in
@@ -770,6 +774,68 @@ void runtime_memory_set_gpu_hooks(GpuRange map, GpuRange unmap, GpuRange invalid
     for (size_t i=0;i<vma_count;++i) if (vmas[i].kind!=KIND_RESERVED) queue_hook(HOOK_MAP,vmas[i].start,vmas[i].end-vmas[i].start);
     write_unlock();
     flush_hooks();
+}
+void runtime_memory_set_gpu_flush(void (*flush)(uintptr_t address, uint64_t size)) {
+    __atomic_store_n(&hook_flush,flush,__ATOMIC_RELEASE);
+}
+/* Kernel copies (file reads and writes, ReadFile/WriteFile) take no page faults: a page the GPU
+ * tracker protects, or protects again between a fault and the copy, makes them fail or stop
+ * short, and the guest saw a successful short read (Uncharted 2 streaming: half-read meshes,
+ * white textures). They go through the backing view instead, which no protection blocks; the
+ * GPU side sees the same as for the guest CPU's own accesses.
+ * One piece of [address, address+size): its host pointer (the backing view in a mapping,
+ * the address itself outside the guest's range) and length; 0 when not accessible. */
+static uint64_t guest_piece(uintptr_t at, uint64_t size, int write, unsigned char **host) {
+    uint64_t n=size;
+    *host=(unsigned char *)at;
+    read_lock();
+    size_t i=vma_index(at);
+    if (i<vma_count && vmas[i].start<=at) {
+        const int prot=host_prot(vmas[i].prot);
+        if (vmas[i].kind==KIND_RESERVED || !(prot & (write ? PROT_WRITE : PROT_READ))) n=0;
+        else {
+            *host=backing_base+vmas[i].phys+(at-vmas[i].start);
+            if (vmas[i].end-at<n) n=vmas[i].end-at;
+        }
+    } else if (at>=USER_MIN && at<USER_MAX) {
+        n=0; /* unmapped guest address */
+    } else if (i<vma_count && vmas[i].start-at<n) {
+        n=vmas[i].start-at; /* host memory (the loader's buffers) up to the next mapping */
+    }
+    read_unlock();
+    return n;
+}
+static int64_t guest_transfer(uintptr_t address, uint64_t size, int write, RuntimeGuestIo io,
+                              void *context) {
+    uint64_t done=0;
+    int64_t error=0;
+    while (done<size) {
+        unsigned char *host;
+        const uint64_t n=guest_piece(address+done,size-done,write,&host);
+        if (!n) { error=-EFAULT; break; }
+        const int64_t moved=io(host,n,done,context);
+        if (moved<0) { error=moved; break; }
+        done+=(uint64_t)moved;
+        if ((uint64_t)moved<n) break; /* end of file */
+    }
+    return done ? (int64_t)done : error;
+}
+/* The host writes into guest memory: what a guest CPU write does to GPU data before (resolved,
+ * as for a write fault) and after (what the GPU uploaded while the bytes arrived is stale). */
+int64_t runtime_memory_guest_fill(uintptr_t address, uint64_t size, RuntimeGuestIo fill, void *context) {
+    if (!size) return 0;
+    const GpuRange invalidate=__atomic_load_n(&hook_invalidate,__ATOMIC_ACQUIRE);
+    if (invalidate) invalidate(address,size);
+    const int64_t n=guest_transfer(address,size,1,fill,context);
+    if (invalidate && n>0) invalidate(address,(uint64_t)n);
+    return n;
+}
+/* The host reads guest memory: GPU data in the range reaches it first (as for a read fault). */
+int64_t runtime_memory_guest_drain(uintptr_t address, uint64_t size, RuntimeGuestIo drain, void *context) {
+    if (!size) return 0;
+    const GpuRange flush=__atomic_load_n(&hook_flush,__ATOMIC_ACQUIRE);
+    if (flush) flush(address,size);
+    return guest_transfer(address,size,0,drain,context);
 }
 /* Writes through the backing view; 0 when part of the range has no backing. */
 int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size) {

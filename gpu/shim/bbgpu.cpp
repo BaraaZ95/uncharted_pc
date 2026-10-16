@@ -48,6 +48,7 @@ uint64_t runtime_process_time_counter(void);
 uint64_t runtime_tsc_frequency(void);
 int32_t* runtime_errno(void);
 void runtime_memory_set_gpu_hooks(RuntimeGpuRange map, RuntimeGpuRange unmap, RuntimeGpuRange invalidate);
+void runtime_memory_set_gpu_flush(RuntimeGpuRange flush);
 }
 
 Frontend::WindowSDL* g_window = nullptr;
@@ -101,6 +102,11 @@ void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
         [](uintptr_t address, uint64_t size) {
             Memory::Instance()->GetRasterizer()->InvalidateMemory(address, size);
         });
+    // Kernel copies out of guest memory (file writes): the GPU's data of the range first, as
+    // a read fault would bring it (runtime_memory_guest_drain).
+    runtime_memory_set_gpu_flush([](uintptr_t address, uint64_t size) {
+        Memory::Instance()->GetRasterizer()->ReadMemory(address, size);
+    });
 }
 void MemoryManager::InvalidateMemory(VAddr address, u64 size) {
     if (rasterizer) rasterizer->InvalidateMemory(address, size);

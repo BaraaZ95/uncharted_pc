@@ -26,6 +26,15 @@ void runtime_mutex_report(void);
 uintptr_t runtime_memory_resolve(const char *name);
 void runtime_memory_report(void);
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
+/* Host I/O on guest memory that the OS kernel copies (file reads/writes), safe from GPU page
+ * tracking (runtime_memory.c). `io` moves up to `size` bytes at `host` (`offset` into the
+ * request) and returns the count, less at end of file, or -errno. Both return the bytes moved,
+ * or -errno when none were. */
+typedef int64_t (*RuntimeGuestIo)(void *host, uint64_t size, uint64_t offset, void *context);
+int64_t runtime_memory_guest_fill(uintptr_t address, uint64_t size, RuntimeGuestIo fill, void *context);
+int64_t runtime_memory_guest_drain(uintptr_t address, uint64_t size, RuntimeGuestIo drain, void *context);
+/* GPU library: writes the GPU's data of a range into guest memory (a read fault's work). */
+void runtime_memory_set_gpu_flush(void (*flush)(uintptr_t address, uint64_t size));
 const char *runtime_import_name(const char *name);
 uintptr_t runtime_rwlock_resolve(const char *name);
 void runtime_rwlock_report(void);
